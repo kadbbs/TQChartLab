@@ -6,9 +6,12 @@ const state = {
   indicatorParams: {},
   charts: [],
   seriesByKey: new Map(),
+  seriesDataByKey: new Map(),
+  primarySeriesKeyByPane: new Map(),
   currentPriceLine: null,
   hasFitted: false,
   isAdjustingRange: false,
+  isSyncingCrosshair: false,
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
@@ -258,6 +261,84 @@ function syncRange(sourceChart, targetChart) {
   });
 }
 
+function seriesValueAtPoint(point) {
+  if (!point) {
+    return null;
+  }
+  if (typeof point.value === "number") {
+    return point.value;
+  }
+  if (typeof point.close === "number") {
+    return point.close;
+  }
+  if (typeof point.high === "number") {
+    return point.high;
+  }
+  if (typeof point.open === "number") {
+    return point.open;
+  }
+  return null;
+}
+
+function findSeriesPointAtTime(seriesKey, time) {
+  const points = state.seriesDataByKey.get(seriesKey) || [];
+  return points.find((point) => point && point.time === time) || null;
+}
+
+function setSeriesData(seriesKey, series, data) {
+  series.setData(data);
+  state.seriesDataByKey.set(seriesKey, data);
+}
+
+function primarySeriesKeyForPane(paneId) {
+  if (paneId === "price") {
+    return "candles";
+  }
+  return state.primarySeriesKeyByPane.get(paneId) || null;
+}
+
+function syncCrosshair(sourcePaneId, param) {
+  if (state.isSyncingCrosshair) {
+    return;
+  }
+
+  const time = param?.time;
+  if (time === undefined) {
+    els.cursorTime.textContent = "--";
+    state.isSyncingCrosshair = true;
+    state.charts.forEach((entry) => {
+      entry.chart.clearCrosshairPosition();
+    });
+    state.isSyncingCrosshair = false;
+    return;
+  }
+
+  els.cursorTime.textContent = formatCrosshairTime(time);
+  state.isSyncingCrosshair = true;
+  state.charts.forEach((entry) => {
+    if (entry.paneId === sourcePaneId) {
+      return;
+    }
+
+    const seriesKey = primarySeriesKeyForPane(entry.paneId);
+    if (!seriesKey) {
+      entry.chart.clearCrosshairPosition();
+      return;
+    }
+
+    const series = state.seriesByKey.get(seriesKey);
+    const point = findSeriesPointAtTime(seriesKey, time);
+    const value = seriesValueAtPoint(point);
+    if (!series || value === null) {
+      entry.chart.clearCrosshairPosition();
+      return;
+    }
+
+    entry.chart.setCrosshairPosition(value, time, series);
+  });
+  state.isSyncingCrosshair = false;
+}
+
 function clampVisibleRange(chart) {
   chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
     if (!range || state.isAdjustingRange) {
@@ -353,6 +434,8 @@ function rebuildCharts() {
   state.charts.forEach((entry) => entry.chart.remove());
   state.charts = [];
   state.seriesByKey = new Map();
+  state.seriesDataByKey = new Map();
+  state.primarySeriesKeyByPane = new Map();
   state.currentPriceLine = null;
   state.hasFitted = false;
   els.chartStack.innerHTML = "";
@@ -373,6 +456,9 @@ function rebuildCharts() {
     });
 
     state.charts.push({ paneId, container: pane, chart });
+    chart.subscribeCrosshairMove((param) => {
+      syncCrosshair(paneId, param);
+    });
   });
 
   for (let i = 0; i < state.charts.length - 1; i += 1) {
@@ -417,14 +503,6 @@ function rebuildCharts() {
     visible: state.charts.length === 1,
   });
   clampVisibleRange(priceChart);
-  priceChart.subscribeCrosshairMove((param) => {
-    if (!param || param.time === undefined) {
-      els.cursorTime.textContent = "--";
-      return;
-    }
-    els.cursorTime.textContent = formatCrosshairTime(param.time);
-  });
-
   state.charts.slice(1).forEach((entry, index) => {
     entry.chart.timeScale().applyOptions({
       visible: index === state.charts.length - 2,
@@ -484,8 +562,8 @@ function applySnapshot(snapshot) {
   const displaySnapshot = trimSnapshotForDisplay(snapshot);
   const candleSeries = state.seriesByKey.get("candles");
   const volumeSeries = state.seriesByKey.get("volume");
-  candleSeries.setData(displaySnapshot.candles);
-  volumeSeries.setData(displaySnapshot.volume);
+  setSeriesData("candles", candleSeries, displaySnapshot.candles);
+  setSeriesData("volume", volumeSeries, displaySnapshot.volume);
 
   if (state.currentPriceLine) {
     candleSeries.removePriceLine(state.currentPriceLine);
@@ -512,8 +590,11 @@ function applySnapshot(snapshot) {
       if (!series) {
         series = createSeries(paneEntry.chart, seriesDefinition);
         state.seriesByKey.set(key, series);
+        if (!state.primarySeriesKeyByPane.has(paneId)) {
+          state.primarySeriesKeyByPane.set(paneId, key);
+        }
       }
-      series.setData(seriesDefinition.data);
+      setSeriesData(key, series, seriesDefinition.data);
     });
   });
 
