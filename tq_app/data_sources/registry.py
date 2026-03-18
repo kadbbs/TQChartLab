@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from typing import Callable
+
+from .base import DataSource
+from .tq import TqDataSource
+
+
+DataSourceFactory = Callable[[str, int, int, int], DataSource]
+
+
+def _build_tq(symbol: str, duration_seconds: int, data_length: int, refresh_ms: int) -> DataSource:
+    return TqDataSource(symbol, duration_seconds, data_length, refresh_ms)
+
+
+DATA_SOURCE_FACTORIES: dict[str, DataSourceFactory] = {
+    "tq": _build_tq,
+}
+
+
+def create_data_source(
+    provider: str,
+    symbol: str,
+    duration_seconds: int,
+    data_length: int,
+    refresh_ms: int,
+) -> DataSource:
+    try:
+        factory = DATA_SOURCE_FACTORIES[provider]
+    except KeyError as exc:
+        names = ", ".join(sorted(DATA_SOURCE_FACTORIES))
+        raise ValueError(f"未知数据源: {provider}，可选值: {names}") from exc
+    return factory(symbol, duration_seconds, data_length, refresh_ms)
+
+
+def get_available_data_sources() -> list[str]:
+    return sorted(DATA_SOURCE_FACTORIES)

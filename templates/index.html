@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TQ Market Chart</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="eyebrow">Market Workbench</div>
+        <h1 id="page-title">TQ 行情图表</h1>
+      </div>
+      <div class="panel">
+        <div class="panel-label">行情</div>
+        <div class="field"><span>数据源</span><strong id="provider-name">--</strong></div>
+        <div class="field"><span>合约</span><strong id="symbol-name">--</strong></div>
+        <div class="field"><span>周期</span><strong id="duration-name">--</strong></div>
+        <div class="field"><span>最新价</span><strong id="last-price">--</strong></div>
+        <div class="field"><span>更新时间</span><strong id="last-update">--</strong></div>
+        <div class="field"><span>光标时间</span><strong id="cursor-time">--</strong></div>
+      </div>
+      <div class="panel">
+        <div class="panel-label">指标</div>
+        <form id="indicator-form" class="indicator-list"></form>
+        <div class="hint">把自定义指标写进项目根目录的 <code>custom_indicators.py</code>，刷新页面后会自动出现。</div>
+      </div>
+      <div id="error-message" class="error"></div>
+    </aside>
+    <main class="main">
+      <div class="canvas-card">
+        <div id="chart-stack" class="chart-stack"></div>
+      </div>
+    </main>
+  </div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
