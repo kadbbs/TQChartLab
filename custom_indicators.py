@@ -87,7 +87,6 @@ class StcIndicator(Indicator):
         macd_high = macd.rolling(cycle_period).max()
         macd_range = (macd_high - macd_low).replace(0, pd.NA)
         stochastic_macd = ((macd - macd_low) / macd_range) * 100
-        stochastic_macd = stochastic_macd.fillna(0)
 
         smooth_stochastic = stochastic_macd.ewm(alpha=smoothing_factor, adjust=False).mean()
 
@@ -95,7 +94,6 @@ class StcIndicator(Indicator):
         smooth_high = smooth_stochastic.rolling(cycle_period).max()
         smooth_range = (smooth_high - smooth_low).replace(0, pd.NA)
         second_stochastic = ((smooth_stochastic - smooth_low) / smooth_range) * 100
-        second_stochastic = second_stochastic.fillna(0)
 
         df["stc"] = second_stochastic.ewm(alpha=smoothing_factor, adjust=False).mean().clip(0, 100)
         df["stc_upper"] = 75.0

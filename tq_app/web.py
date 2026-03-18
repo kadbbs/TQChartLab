@@ -28,12 +28,24 @@ def create_app(service: MarketDataService, project_root: Path) -> Flask:
     def api_snapshot() -> Any:
         indicator_param = request.args.get("indicators", "")
         indicator_params_raw = request.args.get("indicator_params", "")
+        symbol = request.args.get("symbol", "").strip() or None
+        duration_raw = request.args.get("duration_seconds", "").strip()
         indicator_ids = [item.strip() for item in indicator_param.split(",") if item.strip()]
         indicator_params: dict[str, dict[str, Any]] | None = None
+        duration_seconds: int | None = None
         if indicator_params_raw:
             indicator_params = json.loads(indicator_params_raw)
+        if duration_raw:
+            duration_seconds = int(duration_raw)
         try:
-            return jsonify(service.get_snapshot(indicator_ids or None, indicator_params))
+            return jsonify(
+                service.get_snapshot(
+                    indicator_ids or None,
+                    indicator_params,
+                    symbol=symbol,
+                    duration_seconds=duration_seconds,
+                )
+            )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 

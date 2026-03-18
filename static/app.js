@@ -1,18 +1,30 @@
 const state = {
   config: null,
+  activeSymbol: "",
+  activeDurationSeconds: null,
   selectedIndicators: [],
   indicatorParams: {},
   charts: [],
   seriesByKey: new Map(),
   currentPriceLine: null,
   hasFitted: false,
+  isAdjustingRange: false,
 };
+
+const DEFAULT_VISIBLE_BARS = 120;
+const MAX_VISIBLE_BARS = 180;
+const DISPLAY_WARMUP_BARS = 200;
+const RANGE_RIGHT_PADDING_BARS = 8;
+const PRICE_RANGE_TOP_PADDING = 0.1;
+const PRICE_RANGE_BOTTOM_PADDING = 0.14;
 
 const els = {
   title: document.getElementById("page-title"),
   provider: document.getElementById("provider-name"),
   symbol: document.getElementById("symbol-name"),
   duration: document.getElementById("duration-name"),
+  symbolSelect: document.getElementById("symbol-select"),
+  durationSelect: document.getElementById("duration-select"),
   lastPrice: document.getElementById("last-price"),
   lastUpdate: document.getElementById("last-update"),
   cursorTime: document.getElementById("cursor-time"),
@@ -40,15 +52,15 @@ const chartTheme = {
     borderColor: "rgba(92, 70, 47, 0.18)",
     autoScale: true,
     scaleMargins: {
-      top: 0.08,
-      bottom: 0.12,
+      top: 0.16,
+      bottom: 0.2,
     },
   },
   timeScale: {
     borderColor: "rgba(92, 70, 47, 0.18)",
     timeVisible: true,
     secondsVisible: false,
-    rightOffset: 6,
+    rightOffset: 10,
     barSpacing: 10,
     minBarSpacing: 4,
     tickMarkMaxCharacterLength: 18,
@@ -103,6 +115,58 @@ function updateIndicatorParamState(indicatorId, key, value) {
     state.indicatorParams[indicatorId] = {};
   }
   state.indicatorParams[indicatorId][key] = value;
+}
+
+function formatDurationLabel(seconds) {
+  if (seconds < 60) {
+    return `${seconds} 秒`;
+  }
+  if (seconds < 3600) {
+    return `${Math.round(seconds / 60)} 分钟`;
+  }
+  if (seconds < 86400) {
+    return `${Math.round(seconds / 3600)} 小时`;
+  }
+  return `${Math.round(seconds / 86400)} 天`;
+}
+
+function syncMarketHeader(symbolLabel, durationSeconds) {
+  els.title.textContent = `${symbolLabel} 图表工作台`;
+  els.symbol.textContent = symbolLabel;
+  els.duration.textContent = formatDurationLabel(durationSeconds);
+}
+
+function buildDurationOptions(options, activeValue) {
+  els.durationSelect.innerHTML = "";
+  options.forEach((seconds) => {
+    const option = document.createElement("option");
+    option.value = String(seconds);
+    option.textContent = formatDurationLabel(seconds);
+    option.selected = seconds === activeValue;
+    els.durationSelect.append(option);
+  });
+}
+
+function buildContractOptions(contracts, activeSymbol) {
+  els.symbolSelect.innerHTML = "";
+  const normalizedContracts = contracts.length
+    ? contracts
+    : [{ symbol: activeSymbol, label: activeSymbol }];
+  normalizedContracts.forEach((contract) => {
+    const option = document.createElement("option");
+    option.value = contract.symbol;
+    option.textContent = contract.label;
+    option.selected = contract.symbol === activeSymbol;
+    els.symbolSelect.append(option);
+  });
+}
+
+function getRequestedSymbol() {
+  return els.symbolSelect.value || state.config.symbol;
+}
+
+function getRequestedDuration() {
+  return Number(els.durationSelect.value || state.config.duration_seconds);
 }
 
 function buildIndicatorSelector(indicators, defaults) {
@@ -188,9 +252,93 @@ function paneLayoutFor(indicators) {
 
 function syncRange(sourceChart, targetChart) {
   sourceChart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-    if (range) {
+    if (range && !state.isAdjustingRange) {
       targetChart.timeScale().setVisibleLogicalRange(range);
     }
+  });
+}
+
+function clampVisibleRange(chart) {
+  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (!range || state.isAdjustingRange) {
+      return;
+    }
+
+    const span = range.to - range.from;
+    const nextFrom = Math.max(range.from, 0);
+    const nextTo = Math.max(range.to, nextFrom + 1);
+    const nextSpan = nextTo - nextFrom;
+
+    if (nextSpan <= MAX_VISIBLE_BARS && nextFrom === range.from && nextTo === range.to) {
+      return;
+    }
+
+    state.isAdjustingRange = true;
+    chart.timeScale().setVisibleLogicalRange({
+      from: nextSpan > MAX_VISIBLE_BARS ? nextTo - MAX_VISIBLE_BARS : nextFrom,
+      to: nextTo,
+    });
+    state.isAdjustingRange = false;
+  });
+}
+
+function focusRecentBars(chart, barCount) {
+  const visibleBars = Math.min(DEFAULT_VISIBLE_BARS, barCount);
+  chart.timeScale().setVisibleLogicalRange({
+    from: Math.max(0, barCount - visibleBars),
+    to: barCount - 1 + RANGE_RIGHT_PADDING_BARS,
+  });
+}
+
+function firstDefinedPointIndex(points) {
+  return points.findIndex((point) => point && point.value !== null && point.value !== undefined);
+}
+
+function indicatorReadyIndex(snapshot) {
+  const seriesIndices = snapshot.indicators.flatMap((indicator) =>
+    indicator.series
+      .map((series) => firstDefinedPointIndex(series.data))
+      .filter((index) => index >= 0)
+  );
+
+  if (seriesIndices.length === 0) {
+    return 0;
+  }
+  return Math.max(...seriesIndices);
+}
+
+function trimSnapshotForDisplay(snapshot) {
+  const trimCount = Math.min(DISPLAY_WARMUP_BARS, snapshot.candles.length);
+  if (trimCount <= 0) {
+    return snapshot;
+  }
+
+  return {
+    ...snapshot,
+    candles: snapshot.candles.slice(trimCount),
+    volume: snapshot.volume.slice(trimCount),
+    indicators: snapshot.indicators.map((indicator) => ({
+      ...indicator,
+      series: indicator.series.map((series) => ({
+        ...series,
+        data: series.data.slice(trimCount),
+      })),
+    })),
+  };
+}
+
+function focusComputedBars(chart, snapshot) {
+  const barCount = snapshot.candles.length;
+  if (barCount === 0) {
+    return;
+  }
+
+  const readyIndex = indicatorReadyIndex(snapshot);
+  const visibleBars = Math.min(DEFAULT_VISIBLE_BARS, Math.max(1, barCount - readyIndex));
+  const from = Math.max(readyIndex, barCount - visibleBars);
+  chart.timeScale().setVisibleLogicalRange({
+    from,
+    to: barCount - 1 + RANGE_RIGHT_PADDING_BARS,
   });
 }
 
@@ -240,6 +388,23 @@ function rebuildCharts() {
     wickUpColor: "#197278",
     wickDownColor: "#c44536",
     priceLineVisible: false,
+    autoscaleInfoProvider: (original) => {
+      const autoscaleInfo = original();
+      if (!autoscaleInfo || !autoscaleInfo.priceRange) {
+        return autoscaleInfo;
+      }
+
+      const minValue = autoscaleInfo.priceRange.minValue;
+      const maxValue = autoscaleInfo.priceRange.maxValue;
+      const range = Math.max(maxValue - minValue, Math.abs(maxValue) * 0.01, 1e-6);
+      return {
+        ...autoscaleInfo,
+        priceRange: {
+          minValue: minValue - range * PRICE_RANGE_BOTTOM_PADDING,
+          maxValue: maxValue + range * PRICE_RANGE_TOP_PADDING,
+        },
+      };
+    },
   });
   const volumeSeries = priceChart.addHistogramSeries({
     priceScaleId: "",
@@ -251,6 +416,7 @@ function rebuildCharts() {
   priceChart.timeScale().applyOptions({
     visible: state.charts.length === 1,
   });
+  clampVisibleRange(priceChart);
   priceChart.subscribeCrosshairMove((param) => {
     if (!param || param.time === undefined) {
       els.cursorTime.textContent = "--";
@@ -265,7 +431,7 @@ function rebuildCharts() {
     });
     entry.chart.priceScale("right").applyOptions({
       autoScale: true,
-      scaleMargins: { top: 0.12, bottom: 0.12 },
+      scaleMargins: { top: 0.18, bottom: 0.18 },
     });
   });
 
@@ -306,14 +472,20 @@ function formatCrosshairTime(time) {
 
 function applySnapshot(snapshot) {
   els.error.textContent = "";
+  state.activeSymbol = snapshot.symbol;
+  state.activeDurationSeconds = snapshot.duration_seconds;
+  els.symbolSelect.value = snapshot.symbol;
+  els.durationSelect.value = String(snapshot.duration_seconds);
+  syncMarketHeader(snapshot.symbol_label || snapshot.symbol, snapshot.duration_seconds);
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;
 
+  const displaySnapshot = trimSnapshotForDisplay(snapshot);
   const candleSeries = state.seriesByKey.get("candles");
   const volumeSeries = state.seriesByKey.get("volume");
-  candleSeries.setData(snapshot.candles);
-  volumeSeries.setData(snapshot.volume);
+  candleSeries.setData(displaySnapshot.candles);
+  volumeSeries.setData(displaySnapshot.volume);
 
   if (state.currentPriceLine) {
     candleSeries.removePriceLine(state.currentPriceLine);
@@ -327,7 +499,7 @@ function applySnapshot(snapshot) {
     title: "现价",
   });
 
-  snapshot.indicators.forEach((indicator) => {
+  displaySnapshot.indicators.forEach((indicator) => {
     const paneId = indicatorPaneId(indicator);
     const paneEntry = state.charts.find((item) => item.paneId === paneId);
     if (!paneEntry) {
@@ -346,13 +518,19 @@ function applySnapshot(snapshot) {
   });
 
   if (!state.hasFitted && state.charts.length > 0) {
-    state.charts[0].chart.timeScale().fitContent();
+    if (displaySnapshot.indicators.length > 0) {
+      focusComputedBars(state.charts[0].chart, displaySnapshot);
+    } else {
+      focusRecentBars(state.charts[0].chart, displaySnapshot.candles.length);
+    }
     state.hasFitted = true;
   }
 }
 
 async function refreshSnapshot() {
   const params = new URLSearchParams();
+  params.set("symbol", getRequestedSymbol());
+  params.set("duration_seconds", String(getRequestedDuration()));
   if (state.selectedIndicators.length) {
     params.set("indicators", state.selectedIndicators.join(","));
     const selectedParams = {};
@@ -377,13 +555,30 @@ function resizeCharts() {
 
 async function boot() {
   state.config = await fetchJson("/api/config");
+  state.activeSymbol = state.config.symbol;
+  state.activeDurationSeconds = state.config.duration_seconds;
   state.selectedIndicators = [...state.config.default_indicator_ids];
   state.indicatorParams = getDefaultIndicatorParams(state.config.indicators);
 
-  els.title.textContent = `${state.config.symbol} 图表工作台`;
   els.provider.textContent = state.config.provider;
-  els.symbol.textContent = state.config.symbol;
-  els.duration.textContent = `${Math.round(state.config.duration_seconds / 60)} 分钟`;
+  buildContractOptions(state.config.contracts || [], state.config.symbol);
+  buildDurationOptions(state.config.duration_options || [state.config.duration_seconds], state.config.duration_seconds);
+  syncMarketHeader(state.config.symbol_label || state.config.symbol, state.config.duration_seconds);
+
+  els.symbolSelect.addEventListener("change", async () => {
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
+  els.durationSelect.addEventListener("change", async () => {
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
 
   buildIndicatorSelector(state.config.indicators, state.config.default_indicator_ids);
   rebuildCharts();
