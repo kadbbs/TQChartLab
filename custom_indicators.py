@@ -1,19 +1,104 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from tq_app.indicators import Indicator
 from tq_app.models import IndicatorMeta, IndicatorResult, SeriesDefinition
 
 
+def _line_point(time_value: int, value: float | None) -> dict[str, float | int]:
+    if value is None or pd.isna(value):
+        return {"time": int(time_value)}
+    return {"time": int(time_value), "value": float(value)}
+
+
 def _line_data(df: pd.DataFrame, column: str) -> list[dict[str, float | int | None]]:
     return [
-        {
-            "time": int(row.time),
-            "value": None if pd.isna(row.value) else float(row.value),
-        }
+        _line_point(int(row.time), row.value)
         for row in df[["time", column]].rename(columns={column: "value"}).itertuples(index=False)
     ]
+
+
+def _trend_line_data(
+    df: pd.DataFrame,
+    value_column: str,
+    trend_column: str,
+    bullish: bool,
+) -> list[dict[str, float | int | None]]:
+    points: list[dict[str, float | int | None]] = []
+
+    for row in df[["time", value_column, trend_column]].itertuples(index=False):
+        value = None if pd.isna(getattr(row, value_column)) else float(getattr(row, value_column))
+        trend = bool(getattr(row, trend_column)) if not pd.isna(getattr(row, trend_column)) else None
+
+        if value is None or trend is None:
+            points.append(_line_point(int(row.time), None))
+            continue
+
+        points.append(_line_point(int(row.time), value if trend is bullish else None))
+
+    return points
+
+
+def _wma(series: pd.Series, period: int) -> pd.Series:
+    safe_period = max(int(period), 1)
+    weights = np.arange(1, safe_period + 1, dtype="float64")
+    return series.rolling(safe_period).apply(
+        lambda values: float(np.dot(values, weights) / weights.sum()),
+        raw=True,
+    )
+
+
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    safe_period = max(int(period), 1)
+    return series.ewm(span=safe_period, adjust=False).mean()
+
+
+def _hma(series: pd.Series, period: int) -> pd.Series:
+    safe_period = max(int(period), 1)
+    half_length = max(safe_period // 2, 1)
+    sqrt_length = max(int(safe_period**0.5), 1)
+    base = 2 * _wma(series, half_length) - _wma(series, safe_period)
+    return _wma(base, sqrt_length)
+
+
+def _ehma(series: pd.Series, period: int) -> pd.Series:
+    safe_period = max(int(period), 1)
+    half_length = max(safe_period // 2, 1)
+    sqrt_length = max(int(safe_period**0.5), 1)
+    base = 2 * _ema(series, half_length) - _ema(series, safe_period)
+    return _ema(base, sqrt_length)
+
+
+def _thma(series: pd.Series, period: int) -> pd.Series:
+    safe_period = max(int(period), 1)
+    third_length = max(safe_period // 3, 1)
+    half_length = max(safe_period // 2, 1)
+    return _wma(3 * _wma(series, third_length) - _wma(series, half_length) - _wma(series, safe_period), safe_period)
+
+
+def _source_series(df: pd.DataFrame, source: str) -> pd.Series:
+    source_key = (source or "close").lower()
+    if source_key in df.columns:
+        return df[source_key]
+    if source_key == "hl2":
+        return (df["high"] + df["low"]) / 2
+    if source_key == "hlc3":
+        return (df["high"] + df["low"] + df["close"]) / 3
+    if source_key == "ohlc4":
+        return (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    return df["close"]
+
+
+def _hull_mode(series: pd.Series, mode: str, period: int) -> pd.Series:
+    normalized = (mode or "Hma").lower()
+    safe_period = max(int(period), 1)
+    if normalized == "ehma":
+        return _ehma(series, safe_period)
+    if normalized == "thma":
+        return _thma(series, max(int(safe_period / 2), 1))
+    return _hma(series, safe_period)
 
 
 class Ema55Indicator(Indicator):
@@ -144,6 +229,208 @@ class StcIndicator(Indicator):
         )
 
 
+class HullSuiteIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="hull_suite",
+        name="Hull Suite",
+        pane="price",
+        description="单线 Hull 指标，支持 HMA/EHMA/THMA，按趋势切换红绿颜色。",
+        enabled_by_default=False,
+        params=[
+            {
+                "key": "mode",
+                "label": "变体",
+                "type": "string",
+                "default": "Hma",
+                "options": ["Hma", "Ehma", "Thma"],
+            },
+            {"key": "length", "label": "周期", "type": "int", "default": 55, "min": 2, "step": 1},
+            {"key": "length_mult", "label": "倍数", "type": "float", "default": 1.0, "min": 0.1, "step": 0.1},
+            {
+                "key": "source",
+                "label": "价格源",
+                "type": "string",
+                "default": "close",
+                "options": ["close", "open", "high", "low", "hl2", "hlc3", "ohlc4"],
+            },
+            {"key": "switch_color", "label": "趋势着色", "type": "bool", "default": True},
+            {"key": "line_width", "label": "线宽", "type": "int", "default": 2, "min": 1, "max": 6, "step": 1},
+        ],
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict | None = None) -> IndicatorResult:
+        resolved = self.resolve_params(params)
+        mode = resolved["mode"]
+        length = resolved["length"]
+        length_mult = resolved["length_mult"]
+        source = resolved["source"]
+        switch_color = resolved["switch_color"]
+        line_width = resolved["line_width"]
+        df = bars.copy()
+        hull_length = max(int(length * length_mult), 1)
+        hull_source = _source_series(df, source)
+        df["hull"] = _hull_mode(hull_source, mode, hull_length)
+        df["hull_trend_up"] = df["hull"] >= df["hull"].shift(1)
+
+        bullish_color = "#ff4d4f" if switch_color else "#ffffff"
+        bearish_color = "#00a86b" if switch_color else "#ffffff"
+
+        series: list[SeriesDefinition] = [
+            SeriesDefinition(
+                id="hull_suite_up",
+                name=f"Hull Up({mode},{hull_length})",
+                pane="price",
+                series_type="line",
+                data=_trend_line_data(df, "hull", "hull_trend_up", True),
+                options={
+                    "color": bullish_color,
+                    "lineWidth": max(line_width + 1, 2),
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                },
+            ),
+            SeriesDefinition(
+                id="hull_suite_down",
+                name=f"Hull Down({mode},{hull_length})",
+                pane="price",
+                series_type="line",
+                data=_trend_line_data(df, "hull", "hull_trend_up", False),
+                options={
+                    "color": bearish_color,
+                    "lineWidth": max(line_width + 1, 2),
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                },
+            ),
+        ]
+
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=series,
+        )
+
+
+class DuoKongLineIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="duo_kong_line",
+        name="多空线",
+        pane="price",
+        description="HULL 多空线，单线红绿切换，并标注 多 / 空 信号。",
+        enabled_by_default=False,
+        params=[
+            {
+                "key": "mode",
+                "label": "模式",
+                "type": "int",
+                "default": 1,
+                "min": 1,
+                "max": 3,
+                "step": 1,
+                "options": [1, 2, 3],
+            },
+            {"key": "length", "label": "周期", "type": "int", "default": 55, "min": 2, "step": 1},
+            {
+                "key": "source",
+                "label": "价格源",
+                "type": "string",
+                "default": "close",
+                "options": ["close", "open", "high", "low", "hl2", "hlc3", "ohlc4"],
+            },
+            {"key": "line_width", "label": "线宽", "type": "int", "default": 3, "min": 1, "max": 6, "step": 1},
+            {"key": "show_signals", "label": "显示信号", "type": "bool", "default": True},
+        ],
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict | None = None) -> IndicatorResult:
+        resolved = self.resolve_params(params)
+        mode = resolved["mode"]
+        length = resolved["length"]
+        source = resolved["source"]
+        line_width = resolved["line_width"]
+        show_signals = resolved["show_signals"]
+
+        df = bars.copy()
+        hull_source = _source_series(df, source)
+        if mode == 2:
+            df["hull"] = _ehma(hull_source, length)
+        elif mode == 3:
+            df["hull"] = _thma(hull_source, length)
+        else:
+            df["hull"] = _hma(hull_source, length)
+
+        df["trend_up"] = df["hull"] >= df["hull"].shift(1)
+        df["buy_signal"] = (df["hull"] > df["hull"].shift(1)) & (df["hull"].shift(1) <= df["hull"].shift(2))
+        df["sell_signal"] = (df["hull"] < df["hull"].shift(1)) & (df["hull"].shift(1) >= df["hull"].shift(2))
+
+        markers: list[dict[str, str | int]] = []
+        if show_signals:
+            markers.extend(
+                [
+                    {
+                        "time": int(row.time),
+                        "position": "belowBar",
+                        "color": "#ff4d4f",
+                        "shape": "arrowUp",
+                        "text": "多",
+                    }
+                    for row in df.loc[df["buy_signal"], ["time"]].itertuples(index=False)
+                ]
+            )
+            markers.extend(
+                [
+                    {
+                        "time": int(row.time),
+                        "position": "aboveBar",
+                        "color": "#00a86b",
+                        "shape": "arrowDown",
+                        "text": "空",
+                    }
+                    for row in df.loc[df["sell_signal"], ["time"]].itertuples(index=False)
+                ]
+            )
+
+        series = [
+            SeriesDefinition(
+                id="duo_kong_line_up",
+                name=f"多空线上升({length})",
+                pane="price",
+                series_type="line",
+                data=_trend_line_data(df, "hull", "trend_up", True),
+                options={
+                    "color": "#ff4d4f",
+                    "lineWidth": line_width,
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                    "markers": markers,
+                },
+            ),
+            SeriesDefinition(
+                id="duo_kong_line_down",
+                name=f"多空线下降({length})",
+                pane="price",
+                series_type="line",
+                data=_trend_line_data(df, "hull", "trend_up", False),
+                options={
+                    "color": "#00a86b",
+                    "lineWidth": line_width,
+                    "priceLineVisible": False,
+                    "lastValueVisible": False,
+                },
+            ),
+        ]
+
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=series,
+        )
+
+
 def register_indicators(registry) -> None:
     registry.register(Ema55Indicator())
     registry.register(StcIndicator())
+    registry.register(HullSuiteIndicator())
+    registry.register(DuoKongLineIndicator())

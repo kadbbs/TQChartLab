@@ -2,24 +2,182 @@ const state = {
   config: null,
   activeSymbol: "",
   activeDurationSeconds: null,
+  activeBarMode: "time",
+  activeRangeTicks: 10,
   selectedIndicators: [],
   indicatorParams: {},
   charts: [],
   seriesByKey: new Map(),
+  seriesChartByKey: new Map(),
   seriesDataByKey: new Map(),
   primarySeriesKeyByPane: new Map(),
+  bandPrimitiveByKey: new Map(),
   currentPriceLine: null,
   hasFitted: false,
-  isAdjustingRange: false,
   isSyncingCrosshair: false,
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
-const MAX_VISIBLE_BARS = 180;
-const DISPLAY_WARMUP_BARS = 200;
+const MIN_VISIBLE_DATA_BARS = 60;
 const RANGE_RIGHT_PADDING_BARS = 8;
 const PRICE_RANGE_TOP_PADDING = 0.1;
 const PRICE_RANGE_BOTTOM_PADDING = 0.14;
+const RENKO_DEFAULT_TICKS = 5;
+const RANGE_DEFAULT_TICKS = 10;
+
+class LineBandPrimitiveRenderer {
+  constructor(source) {
+    this._source = source;
+  }
+
+  draw(target) {
+    const segments = this._source.coordinateSegments();
+    if (!segments.length) {
+      return;
+    }
+
+    target.useMediaCoordinateSpace((scope) => {
+      const { context } = scope;
+      context.save();
+      context.fillStyle = this._source.fillColor();
+
+      segments.forEach((segment) => {
+        if (segment.length < 2) {
+          return;
+        }
+        context.beginPath();
+        context.moveTo(segment[0].x, segment[0].y1);
+        for (let index = 1; index < segment.length; index += 1) {
+          context.lineTo(segment[index].x, segment[index].y1);
+        }
+        for (let index = segment.length - 1; index >= 0; index -= 1) {
+          context.lineTo(segment[index].x, segment[index].y2);
+        }
+        context.closePath();
+        context.fill();
+      });
+
+      context.restore();
+    });
+  }
+}
+
+class LineBandPrimitivePaneView {
+  constructor(source) {
+    this._source = source;
+    this._renderer = new LineBandPrimitiveRenderer(source);
+  }
+
+  zOrder() {
+    return "bottom";
+  }
+
+  renderer() {
+    return this._renderer;
+  }
+}
+
+class LineBandPrimitive {
+  constructor(fillColor) {
+    this._fillColor = fillColor;
+    this._chart = null;
+    this._primarySeries = null;
+    this._secondarySeries = null;
+    this._primaryData = [];
+    this._secondaryData = [];
+    this._requestUpdate = null;
+    this._paneViews = [new LineBandPrimitivePaneView(this)];
+  }
+
+  attached({ chart, series, requestUpdate }) {
+    this._chart = chart;
+    this._primarySeries = series;
+    this._requestUpdate = requestUpdate;
+  }
+
+  detached() {
+    this._chart = null;
+    this._primarySeries = null;
+    this._requestUpdate = null;
+  }
+
+  updateAllViews() {
+    this._requestUpdate?.();
+  }
+
+  paneViews() {
+    return this._paneViews;
+  }
+
+  fillColor() {
+    return this._fillColor;
+  }
+
+  setFillColor(fillColor) {
+    this._fillColor = fillColor;
+    this.updateAllViews();
+  }
+
+  setSecondarySeries(series) {
+    this._secondarySeries = series;
+    this.updateAllViews();
+  }
+
+  setData(primaryData, secondaryData) {
+    this._primaryData = primaryData || [];
+    this._secondaryData = secondaryData || [];
+    this.updateAllViews();
+  }
+
+  coordinateSegments() {
+    if (!this._chart || !this._primarySeries || !this._secondarySeries) {
+      return [];
+    }
+
+    const timeScale = this._chart.timeScale();
+    const secondaryByTime = new Map(
+      this._secondaryData
+        .filter((point) => typeof point?.value === "number")
+        .map((point) => [String(point.time), point.value])
+    );
+
+    const segments = [];
+    let currentSegment = [];
+
+    const flush = () => {
+      if (currentSegment.length) {
+        segments.push(currentSegment);
+        currentSegment = [];
+      }
+    };
+
+    this._primaryData.forEach((point) => {
+      if (typeof point?.value !== "number") {
+        flush();
+        return;
+      }
+
+      const pairedValue = secondaryByTime.get(String(point.time));
+      if (typeof pairedValue !== "number") {
+        flush();
+        return;
+      }
+
+      const x = timeScale.timeToCoordinate(point.time);
+      const y1 = this._primarySeries.priceToCoordinate(point.value);
+      const y2 = this._secondarySeries.priceToCoordinate(pairedValue);
+      if (!Number.isFinite(x) || !Number.isFinite(y1) || !Number.isFinite(y2)) {
+        flush();
+        return;
+      }
+
+      currentSegment.push({ x, y1, y2 });
+    });
+
+    flush();
+    return segments;
+  }
+}
 
 const els = {
   title: document.getElementById("page-title"),
@@ -27,7 +185,10 @@ const els = {
   symbol: document.getElementById("symbol-name"),
   duration: document.getElementById("duration-name"),
   symbolSelect: document.getElementById("symbol-select"),
+  barModeSelect: document.getElementById("bar-mode-select"),
   durationSelect: document.getElementById("duration-select"),
+  barSizeLabel: document.getElementById("bar-size-label"),
+  rangeTicksInput: document.getElementById("range-ticks-input"),
   lastPrice: document.getElementById("last-price"),
   lastUpdate: document.getElementById("last-update"),
   cursorTime: document.getElementById("cursor-time"),
@@ -35,6 +196,8 @@ const els = {
   chartStack: document.getElementById("chart-stack"),
   error: document.getElementById("error-message"),
 };
+
+state.timeLabels = new Map();
 
 const chartTheme = {
   layout: {
@@ -99,7 +262,7 @@ async function fetchJson(url) {
 }
 
 function getIndicatorIds() {
-  return [...els.indicatorForm.querySelectorAll("input[type=checkbox]:checked")].map((item) => item.value);
+  return [...els.indicatorForm.querySelectorAll('input[data-role="indicator-toggle"]:checked')].map((item) => item.value);
 }
 
 function getDefaultIndicatorParams(indicators) {
@@ -120,6 +283,58 @@ function updateIndicatorParamState(indicatorId, key, value) {
   state.indicatorParams[indicatorId][key] = value;
 }
 
+function indicatorParamValue(indicatorId, param) {
+  const currentValue = state.indicatorParams[indicatorId]?.[param.key];
+  return currentValue ?? param.default;
+}
+
+function createIndicatorParamInput(indicatorId, param, enabled) {
+  let input;
+  const currentValue = indicatorParamValue(indicatorId, param);
+
+  if (param.type === "bool") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(currentValue);
+  } else if (Array.isArray(param.options) && param.options.length > 0) {
+    input = document.createElement("select");
+    param.options.forEach((optionValue) => {
+      const option = document.createElement("option");
+      option.value = String(optionValue);
+      option.textContent = String(optionValue);
+      option.selected = String(currentValue) === String(optionValue);
+      input.append(option);
+    });
+  } else if (param.type === "int" || param.type === "float") {
+    input = document.createElement("input");
+    input.type = "number";
+    input.value = currentValue;
+    input.step = param.step ?? "any";
+    if (param.min !== undefined) {
+      input.min = param.min;
+    }
+    if (param.max !== undefined) {
+      input.max = param.max;
+    }
+  } else {
+    input = document.createElement("input");
+    input.type = "text";
+    input.value = currentValue;
+  }
+
+  input.dataset.indicatorId = indicatorId;
+  input.dataset.paramKey = param.key;
+  input.disabled = !enabled;
+  input.addEventListener("change", async (event) => {
+    const nextValue = param.type === "bool" ? event.target.checked : event.target.value;
+    updateIndicatorParamState(indicatorId, param.key, nextValue);
+    if (enabled) {
+      await refreshSnapshot();
+    }
+  });
+  return input;
+}
+
 function formatDurationLabel(seconds) {
   if (seconds < 60) {
     return `${seconds} 秒`;
@@ -133,10 +348,23 @@ function formatDurationLabel(seconds) {
   return `${Math.round(seconds / 86400)} 天`;
 }
 
-function syncMarketHeader(symbolLabel, durationSeconds) {
+function formatBarModeLabel(barMode, durationSeconds, rangeTicks) {
+  if (barMode === "tick") {
+    return "Tick 图";
+  }
+  if (barMode === "range") {
+    return `${rangeTicks} Tick Range`;
+  }
+  if (barMode === "renko") {
+    return `${rangeTicks} Tick Renko`;
+  }
+  return formatDurationLabel(durationSeconds);
+}
+
+function syncMarketHeader(symbolLabel, durationSeconds, barMode, rangeTicks) {
   els.title.textContent = `${symbolLabel} 图表工作台`;
   els.symbol.textContent = symbolLabel;
-  els.duration.textContent = formatDurationLabel(durationSeconds);
+  els.duration.textContent = formatBarModeLabel(barMode, durationSeconds, rangeTicks);
 }
 
 function buildDurationOptions(options, activeValue) {
@@ -147,6 +375,17 @@ function buildDurationOptions(options, activeValue) {
     option.textContent = formatDurationLabel(seconds);
     option.selected = seconds === activeValue;
     els.durationSelect.append(option);
+  });
+}
+
+function buildBarModeOptions(options, activeValue) {
+  els.barModeSelect.innerHTML = "";
+  options.forEach((mode) => {
+    const option = document.createElement("option");
+    option.value = mode.id;
+    option.textContent = mode.label;
+    option.selected = mode.id === activeValue;
+    els.barModeSelect.append(option);
   });
 }
 
@@ -172,6 +411,80 @@ function getRequestedDuration() {
   return Number(els.durationSelect.value || state.config.duration_seconds);
 }
 
+function getRequestedBarMode() {
+  return els.barModeSelect.value || state.config.bar_mode || "time";
+}
+
+function getRequestedRangeTicks() {
+  const value = Number(els.rangeTicksInput.value || state.config.range_ticks || 10);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : 10;
+}
+
+function defaultTicksForBarMode(barMode) {
+  if (barMode === "renko") {
+    return RENKO_DEFAULT_TICKS;
+  }
+  if (barMode === "range") {
+    return RANGE_DEFAULT_TICKS;
+  }
+  return state.config?.range_ticks || RANGE_DEFAULT_TICKS;
+}
+
+function syncBarModeControls(barMode) {
+  const usesDuration = barMode === "time";
+  const usesTicks = barMode === "range" || barMode === "renko";
+  els.durationSelect.disabled = !usesDuration;
+  els.rangeTicksInput.disabled = !usesTicks;
+  if (barMode === "renko") {
+    els.barSizeLabel.textContent = "Renko Tick";
+  } else if (barMode === "range") {
+    els.barSizeLabel.textContent = "Range Tick";
+  } else {
+    els.barSizeLabel.textContent = "价格 Tick";
+  }
+}
+
+function sanitizePricePaneIndicators(snapshot) {
+  if (snapshot.bar_mode !== "time" || snapshot.candles.length === 0) {
+    return snapshot;
+  }
+
+  const lows = snapshot.candles.map((item) => item.low).filter((value) => Number.isFinite(value));
+  const highs = snapshot.candles.map((item) => item.high).filter((value) => Number.isFinite(value));
+  if (lows.length === 0 || highs.length === 0) {
+    return snapshot;
+  }
+
+  const candleMin = Math.min(...lows);
+  const candleMax = Math.max(...highs);
+  const lowerBound = candleMin > 0 ? candleMin * 0.5 : candleMin - Math.abs(candleMax - candleMin) * 2;
+  const upperBound = candleMax > 0 ? candleMax * 1.5 : candleMax + Math.abs(candleMax - candleMin) * 2;
+
+  return {
+    ...snapshot,
+    indicators: snapshot.indicators.map((indicator) => {
+      if (indicator.pane !== "price") {
+        return indicator;
+      }
+      return {
+        ...indicator,
+        series: indicator.series.map((series) => ({
+          ...series,
+          data: series.data.map((point) => {
+            if (typeof point?.value !== "number") {
+              return point;
+            }
+            if (point.value < lowerBound || point.value > upperBound) {
+              return { ...point, value: null };
+            }
+            return point;
+          }),
+        })),
+      };
+    }),
+  };
+}
+
 function buildIndicatorSelector(indicators, defaults) {
   els.indicatorForm.innerHTML = "";
   indicators.forEach((indicator) => {
@@ -181,6 +494,7 @@ function buildIndicatorSelector(indicators, defaults) {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.value = indicator.id;
+    checkbox.dataset.role = "indicator-toggle";
     checkbox.checked = defaults.includes(indicator.id);
     checkbox.addEventListener("change", async () => {
       state.selectedIndicators = getIndicatorIds();
@@ -204,25 +518,7 @@ function buildIndicatorSelector(indicators, defaults) {
       const title = document.createElement("small");
       title.textContent = param.label;
 
-      const input = document.createElement("input");
-      input.type = "number";
-      input.value = state.indicatorParams[indicator.id]?.[param.key] ?? param.default;
-      input.dataset.indicatorId = indicator.id;
-      input.dataset.paramKey = param.key;
-      input.step = param.step ?? "any";
-      if (param.min !== undefined) {
-        input.min = param.min;
-      }
-      if (param.max !== undefined) {
-        input.max = param.max;
-      }
-      input.disabled = !checkbox.checked;
-      input.addEventListener("change", async (event) => {
-        updateIndicatorParamState(indicator.id, param.key, event.target.value);
-        if (checkbox.checked) {
-          await refreshSnapshot();
-        }
-      });
+      const input = createIndicatorParamInput(indicator.id, param, checkbox.checked);
 
       field.append(title, input);
       paramsWrap.append(field);
@@ -290,6 +586,56 @@ function setSeriesData(seriesKey, series, data) {
   state.seriesDataByKey.set(seriesKey, data);
 }
 
+function removeSeriesByKey(seriesKey) {
+  const primitive = state.bandPrimitiveByKey.get(seriesKey);
+  const series = state.seriesByKey.get(seriesKey);
+  if (primitive && series?.detachPrimitive) {
+    series.detachPrimitive(primitive);
+  }
+  state.bandPrimitiveByKey.delete(seriesKey);
+
+  const chart = state.seriesChartByKey.get(seriesKey);
+  if (chart && series) {
+    chart.removeSeries(series);
+  }
+
+  state.seriesByKey.delete(seriesKey);
+  state.seriesChartByKey.delete(seriesKey);
+  state.seriesDataByKey.delete(seriesKey);
+  state.primarySeriesKeyByPane.forEach((value, key) => {
+    if (value === seriesKey) {
+      state.primarySeriesKeyByPane.delete(key);
+    }
+  });
+}
+
+function syncBandPrimitive(primaryKey, secondaryKey, fillColor) {
+  const primarySeries = state.seriesByKey.get(primaryKey);
+  const secondarySeries = state.seriesByKey.get(secondaryKey);
+  if (!primarySeries || !secondarySeries || typeof primarySeries.attachPrimitive !== "function") {
+    const existing = state.bandPrimitiveByKey.get(primaryKey);
+    if (existing && primarySeries?.detachPrimitive) {
+      primarySeries.detachPrimitive(existing);
+      state.bandPrimitiveByKey.delete(primaryKey);
+    }
+    return;
+  }
+
+  let primitive = state.bandPrimitiveByKey.get(primaryKey);
+  if (!primitive) {
+    primitive = new LineBandPrimitive(fillColor);
+    primarySeries.attachPrimitive(primitive);
+    state.bandPrimitiveByKey.set(primaryKey, primitive);
+  }
+
+  primitive.setFillColor(fillColor);
+  primitive.setSecondarySeries(secondarySeries);
+  primitive.setData(
+    state.seriesDataByKey.get(primaryKey) || [],
+    state.seriesDataByKey.get(secondaryKey) || []
+  );
+}
+
 function primarySeriesKeyForPane(paneId) {
   if (paneId === "price") {
     return "candles";
@@ -339,30 +685,6 @@ function syncCrosshair(sourcePaneId, param) {
   state.isSyncingCrosshair = false;
 }
 
-function clampVisibleRange(chart) {
-  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-    if (!range || state.isAdjustingRange) {
-      return;
-    }
-
-    const span = range.to - range.from;
-    const nextFrom = Math.max(range.from, 0);
-    const nextTo = Math.max(range.to, nextFrom + 1);
-    const nextSpan = nextTo - nextFrom;
-
-    if (nextSpan <= MAX_VISIBLE_BARS && nextFrom === range.from && nextTo === range.to) {
-      return;
-    }
-
-    state.isAdjustingRange = true;
-    chart.timeScale().setVisibleLogicalRange({
-      from: nextSpan > MAX_VISIBLE_BARS ? nextTo - MAX_VISIBLE_BARS : nextFrom,
-      to: nextTo,
-    });
-    state.isAdjustingRange = false;
-  });
-}
-
 function focusRecentBars(chart, barCount) {
   const visibleBars = Math.min(DEFAULT_VISIBLE_BARS, barCount);
   chart.timeScale().setVisibleLogicalRange({
@@ -389,13 +711,20 @@ function indicatorReadyIndex(snapshot) {
 }
 
 function trimSnapshotForDisplay(snapshot) {
-  const trimCount = Math.min(DISPLAY_WARMUP_BARS, snapshot.candles.length);
+  const readyIndex = indicatorReadyIndex(snapshot);
+  const maxTrim = Math.max(snapshot.candles.length - MIN_VISIBLE_DATA_BARS, 0);
+  const trimCount = Math.min(Math.max(readyIndex, 0), maxTrim);
   if (trimCount <= 0) {
     return snapshot;
   }
 
+  const timeLabels = Object.fromEntries(
+    snapshot.candles.slice(trimCount).map((candle) => [String(candle.time), snapshot.time_labels?.[String(candle.time)] || ""])
+  );
+
   return {
     ...snapshot,
+    time_labels: timeLabels,
     candles: snapshot.candles.slice(trimCount),
     volume: snapshot.volume.slice(trimCount),
     indicators: snapshot.indicators.map((indicator) => ({
@@ -434,8 +763,10 @@ function rebuildCharts() {
   state.charts.forEach((entry) => entry.chart.remove());
   state.charts = [];
   state.seriesByKey = new Map();
+  state.seriesChartByKey = new Map();
   state.seriesDataByKey = new Map();
   state.primarySeriesKeyByPane = new Map();
+  state.bandPrimitiveByKey = new Map();
   state.currentPriceLine = null;
   state.hasFitted = false;
   els.chartStack.innerHTML = "";
@@ -502,7 +833,6 @@ function rebuildCharts() {
   priceChart.timeScale().applyOptions({
     visible: state.charts.length === 1,
   });
-  clampVisibleRange(priceChart);
   state.charts.slice(1).forEach((entry, index) => {
     entry.chart.timeScale().applyOptions({
       visible: index === state.charts.length - 2,
@@ -518,13 +848,14 @@ function rebuildCharts() {
 }
 
 function createSeries(chart, definition) {
+  const { fillToSeriesId, fillColor, markers, ...renderOptions } = definition.options || {};
   switch (definition.series_type) {
     case "line":
-      return chart.addLineSeries(definition.options || {});
+      return chart.addLineSeries(renderOptions);
     case "histogram":
-      return chart.addHistogramSeries(definition.options || {});
+      return chart.addHistogramSeries(renderOptions);
     case "area":
-      return chart.addAreaSeries(definition.options || {});
+      return chart.addAreaSeries(renderOptions);
     default:
       throw new Error(`暂不支持的序列类型: ${definition.series_type}`);
   }
@@ -535,6 +866,12 @@ function indicatorPaneId(indicator) {
 }
 
 function formatCrosshairTime(time) {
+  if (typeof time === "number") {
+    const exact = state.timeLabels.get(String(time));
+    if (exact) {
+      return exact;
+    }
+  }
   if (typeof time === "number") {
     return new Date(time * 1000).toLocaleString("zh-CN", {
       hour12: false,
@@ -550,20 +887,42 @@ function formatCrosshairTime(time) {
 
 function applySnapshot(snapshot) {
   els.error.textContent = "";
+  const nextBarMode = snapshot.bar_mode || "time";
+  const nextRangeTicks = snapshot.range_ticks || state.config.range_ticks || 10;
+  const shouldRefit =
+    snapshot.symbol !== state.activeSymbol ||
+    snapshot.duration_seconds !== state.activeDurationSeconds ||
+    nextBarMode !== state.activeBarMode ||
+    nextRangeTicks !== state.activeRangeTicks;
+
   state.activeSymbol = snapshot.symbol;
   state.activeDurationSeconds = snapshot.duration_seconds;
+  state.activeBarMode = nextBarMode;
+  state.activeRangeTicks = nextRangeTicks;
+  state.timeLabels = new Map(Object.entries(snapshot.time_labels || {}));
   els.symbolSelect.value = snapshot.symbol;
+  els.barModeSelect.value = state.activeBarMode;
   els.durationSelect.value = String(snapshot.duration_seconds);
-  syncMarketHeader(snapshot.symbol_label || snapshot.symbol, snapshot.duration_seconds);
+  els.rangeTicksInput.value = String(state.activeRangeTicks);
+  syncBarModeControls(state.activeBarMode);
+  syncMarketHeader(
+    snapshot.symbol_label || snapshot.symbol,
+    snapshot.duration_seconds,
+    state.activeBarMode,
+    state.activeRangeTicks
+  );
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;
 
-  const displaySnapshot = trimSnapshotForDisplay(snapshot);
+  const sanitizedSnapshot = sanitizePricePaneIndicators(snapshot);
+  const displaySnapshot = trimSnapshotForDisplay(sanitizedSnapshot);
+  state.timeLabels = new Map(Object.entries(displaySnapshot.time_labels || {}));
   const candleSeries = state.seriesByKey.get("candles");
   const volumeSeries = state.seriesByKey.get("volume");
   setSeriesData("candles", candleSeries, displaySnapshot.candles);
   setSeriesData("volume", volumeSeries, displaySnapshot.volume);
+  const activeBandPrimaryKeys = new Set();
 
   if (state.currentPriceLine) {
     candleSeries.removePriceLine(state.currentPriceLine);
@@ -578,6 +937,8 @@ function applySnapshot(snapshot) {
   });
 
   displaySnapshot.indicators.forEach((indicator) => {
+    const activeSeriesKeys = new Set(["candles", "volume"]);
+    const bandConfigs = [];
     const paneId = indicatorPaneId(indicator);
     const paneEntry = state.charts.find((item) => item.paneId === paneId);
     if (!paneEntry) {
@@ -586,18 +947,54 @@ function applySnapshot(snapshot) {
 
     indicator.series.forEach((seriesDefinition) => {
       const key = `indicator:${indicator.id}:${seriesDefinition.id}`;
+      activeSeriesKeys.add(key);
       let series = state.seriesByKey.get(key);
       if (!series) {
         series = createSeries(paneEntry.chart, seriesDefinition);
         state.seriesByKey.set(key, series);
+        state.seriesChartByKey.set(key, paneEntry.chart);
         if (!state.primarySeriesKeyByPane.has(paneId)) {
           state.primarySeriesKeyByPane.set(paneId, key);
         }
       }
       setSeriesData(key, series, seriesDefinition.data);
+      if (typeof series.setMarkers === "function") {
+        series.setMarkers(seriesDefinition.options?.markers || []);
+      }
+
+      if (seriesDefinition.options?.fillToSeriesId) {
+        activeBandPrimaryKeys.add(key);
+        bandConfigs.push({
+          primaryKey: key,
+          secondaryKey: `indicator:${indicator.id}:${seriesDefinition.options.fillToSeriesId}`,
+          fillColor: seriesDefinition.options.fillColor || "rgba(255, 152, 0, 0.16)",
+        });
+      }
     });
+
+    bandConfigs.forEach((config) => {
+      syncBandPrimitive(config.primaryKey, config.secondaryKey, config.fillColor);
+    });
+
+    [...state.seriesByKey.keys()]
+      .filter((key) => key.startsWith(`indicator:${indicator.id}:`) && !activeSeriesKeys.has(key))
+      .forEach((key) => removeSeriesByKey(key));
   });
 
+  [...state.bandPrimitiveByKey.keys()]
+    .filter((key) => !activeBandPrimaryKeys.has(key))
+    .forEach((key) => {
+      const series = state.seriesByKey.get(key);
+      const primitive = state.bandPrimitiveByKey.get(key);
+      if (series?.detachPrimitive && primitive) {
+        series.detachPrimitive(primitive);
+      }
+      state.bandPrimitiveByKey.delete(key);
+    });
+
+  if (shouldRefit) {
+    state.hasFitted = false;
+  }
   if (!state.hasFitted && state.charts.length > 0) {
     if (displaySnapshot.indicators.length > 0) {
       focusComputedBars(state.charts[0].chart, displaySnapshot);
@@ -612,6 +1009,8 @@ async function refreshSnapshot() {
   const params = new URLSearchParams();
   params.set("symbol", getRequestedSymbol());
   params.set("duration_seconds", String(getRequestedDuration()));
+  params.set("bar_mode", getRequestedBarMode());
+  params.set("range_ticks", String(getRequestedRangeTicks()));
   if (state.selectedIndicators.length) {
     params.set("indicators", state.selectedIndicators.join(","));
     const selectedParams = {};
@@ -638,13 +1037,24 @@ async function boot() {
   state.config = await fetchJson("/api/config");
   state.activeSymbol = state.config.symbol;
   state.activeDurationSeconds = state.config.duration_seconds;
+  state.activeBarMode = state.config.bar_mode || "time";
+  state.activeRangeTicks = state.config.range_ticks || 10;
+  state.timeLabels = new Map();
   state.selectedIndicators = [...state.config.default_indicator_ids];
   state.indicatorParams = getDefaultIndicatorParams(state.config.indicators);
 
   els.provider.textContent = state.config.provider;
   buildContractOptions(state.config.contracts || [], state.config.symbol);
+  buildBarModeOptions(state.config.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
   buildDurationOptions(state.config.duration_options || [state.config.duration_seconds], state.config.duration_seconds);
-  syncMarketHeader(state.config.symbol_label || state.config.symbol, state.config.duration_seconds);
+  els.rangeTicksInput.value = String(state.activeRangeTicks);
+  syncBarModeControls(state.activeBarMode);
+  syncMarketHeader(
+    state.config.symbol_label || state.config.symbol,
+    state.config.duration_seconds,
+    state.activeBarMode,
+    state.activeRangeTicks
+  );
 
   els.symbolSelect.addEventListener("change", async () => {
     try {
@@ -653,7 +1063,31 @@ async function boot() {
       els.error.textContent = error.message;
     }
   });
+  els.barModeSelect.addEventListener("change", async () => {
+    const nextBarMode = getRequestedBarMode();
+    const previousBarMode = state.activeBarMode;
+    if ((nextBarMode === "renko" || nextBarMode === "range") && previousBarMode !== nextBarMode) {
+      const previousDefault = defaultTicksForBarMode(previousBarMode);
+      const currentTicks = getRequestedRangeTicks();
+      if (currentTicks === previousDefault || !els.rangeTicksInput.value) {
+        els.rangeTicksInput.value = String(defaultTicksForBarMode(nextBarMode));
+      }
+    }
+    syncBarModeControls(nextBarMode);
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
   els.durationSelect.addEventListener("change", async () => {
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
+  els.rangeTicksInput.addEventListener("change", async () => {
     try {
       await refreshSnapshot();
     } catch (error) {

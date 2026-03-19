@@ -6,11 +6,18 @@ from .base import DataSource
 from .tq import TqDataSource
 
 
-DataSourceFactory = Callable[[str, int, int, int], DataSource]
+DataSourceFactory = Callable[[str, int, int, int, str, int], DataSource]
 
 
-def _build_tq(symbol: str, duration_seconds: int, data_length: int, refresh_ms: int) -> DataSource:
-    return TqDataSource(symbol, duration_seconds, data_length, refresh_ms)
+def _build_tq(
+    symbol: str,
+    duration_seconds: int,
+    data_length: int,
+    refresh_ms: int,
+    bar_mode: str,
+    range_ticks: int,
+) -> DataSource:
+    return TqDataSource(symbol, duration_seconds, data_length, refresh_ms, bar_mode, range_ticks)
 
 
 DATA_SOURCE_FACTORIES: dict[str, DataSourceFactory] = {
@@ -24,13 +31,15 @@ def create_data_source(
     duration_seconds: int,
     data_length: int,
     refresh_ms: int,
+    bar_mode: str,
+    range_ticks: int,
 ) -> DataSource:
     try:
         factory = DATA_SOURCE_FACTORIES[provider]
     except KeyError as exc:
         names = ", ".join(sorted(DATA_SOURCE_FACTORIES))
         raise ValueError(f"未知数据源: {provider}，可选值: {names}") from exc
-    return factory(symbol, duration_seconds, data_length, refresh_ms)
+    return factory(symbol, duration_seconds, data_length, refresh_ms, bar_mode, range_ticks)
 
 
 def get_available_data_sources() -> list[str]:

@@ -15,6 +15,13 @@ from tq_app.models import IndicatorMeta, IndicatorResult
 TV_UP = "#089981"
 TV_DOWN = "#f23645"
 DEFAULT_DURATION_OPTIONS = [60, 300, 900, 1800, 3600, 86400]
+DEFAULT_BAR_MODES = [
+    {"id": "time", "label": "时间 K 线"},
+    {"id": "tick", "label": "Tick 图"},
+    {"id": "range", "label": "Range Bar"},
+    {"id": "renko", "label": "Renko"},
+]
+DEFAULT_RANGE_TICKS = 10
 
 
 class MarketDataService:
@@ -26,6 +33,8 @@ class MarketDataService:
         data_length: int,
         refresh_ms: int,
         project_root: Path,
+        bar_mode: str = "time",
+        range_ticks: int = DEFAULT_RANGE_TICKS,
     ) -> None:
         self.provider = provider
         self.symbol = symbol
@@ -33,14 +42,16 @@ class MarketDataService:
         self.data_length = data_length
         self.refresh_ms = refresh_ms
         self.project_root = project_root
+        self.bar_mode = bar_mode
+        self.range_ticks = range_ticks
         self._source_lock = threading.Lock()
-        self._data_sources: dict[tuple[str, int], DataSource] = {}
+        self._data_sources: dict[tuple[str, int, str, int], DataSource] = {}
         self.contracts = self._load_contracts()
         self._contract_map = {item["symbol"]: item for item in self.contracts}
         self.indicators = build_indicator_registry(project_root)
 
     def start(self) -> None:
-        self._get_data_source(self.symbol, self.duration_seconds)
+        self._get_data_source(self.symbol, self.duration_seconds, self.bar_mode, self.range_ticks)
 
     def stop(self) -> None:
         with self._source_lock:
@@ -58,6 +69,9 @@ class MarketDataService:
             "symbol_label": self._symbol_label(self.symbol),
             "duration_seconds": self.duration_seconds,
             "duration_options": DEFAULT_DURATION_OPTIONS,
+            "bar_mode": self.bar_mode,
+            "bar_modes": DEFAULT_BAR_MODES,
+            "range_ticks": self.range_ticks,
             "data_length": self.data_length,
             "refresh_ms": self.refresh_ms,
             "contracts": self.contracts,
@@ -71,10 +85,19 @@ class MarketDataService:
         indicator_params: dict[str, dict[str, Any]] | None = None,
         symbol: str | None = None,
         duration_seconds: int | None = None,
+        bar_mode: str | None = None,
+        range_ticks: int | None = None,
     ) -> dict[str, Any]:
         effective_symbol = (symbol or self.symbol).strip()
         effective_duration = duration_seconds or self.duration_seconds
-        bars = self._get_data_source(effective_symbol, effective_duration).get_bars()
+        effective_bar_mode = (bar_mode or self.bar_mode).strip() or "time"
+        effective_range_ticks = range_ticks or self.range_ticks
+        bars = self._get_data_source(
+            effective_symbol,
+            effective_duration,
+            effective_bar_mode,
+            effective_range_ticks,
+        ).get_bars()
         normalized = self._with_chart_time(bars)
         selected = indicator_ids or self.indicators.default_ids()
         all_params = indicator_params or {}
@@ -93,6 +116,9 @@ class MarketDataService:
             "symbol_label": self._symbol_label(effective_symbol),
             "provider": self.provider,
             "duration_seconds": effective_duration,
+            "bar_mode": effective_bar_mode,
+            "range_ticks": effective_range_ticks,
+            "time_labels": self._serialize_time_labels(normalized),
             "candles": self._serialize_candles(normalized),
             "volume": self._serialize_volume(normalized),
             "indicators": [self._serialize_indicator(item) for item in results],
@@ -129,13 +155,23 @@ class MarketDataService:
             return str(contract["label"])
         return format_contract_label(symbol)
 
-    def _get_data_source(self, symbol: str, duration_seconds: int) -> DataSource:
+    def _get_data_source(
+        self,
+        symbol: str,
+        duration_seconds: int,
+        bar_mode: str,
+        range_ticks: int,
+    ) -> DataSource:
         if not symbol:
             raise ValueError("合约不能为空。")
+        if bar_mode not in {item["id"] for item in DEFAULT_BAR_MODES}:
+            raise ValueError(f"未知图表类型: {bar_mode}")
         if duration_seconds <= 0:
             raise ValueError("周期必须大于 0 秒。")
+        if range_ticks <= 0:
+            raise ValueError("Range Tick 必须大于 0。")
 
-        key = (symbol, duration_seconds)
+        key = (symbol, duration_seconds, bar_mode, range_ticks)
         with self._source_lock:
             data_source = self._data_sources.get(key)
             if data_source is None:
@@ -145,6 +181,8 @@ class MarketDataService:
                     duration_seconds=duration_seconds,
                     data_length=self.data_length,
                     refresh_ms=self.refresh_ms,
+                    bar_mode=bar_mode,
+                    range_ticks=range_ticks,
                 )
                 data_source.start()
                 self._data_sources[key] = data_source
@@ -153,7 +191,17 @@ class MarketDataService:
     @staticmethod
     def _with_chart_time(bars: pd.DataFrame) -> pd.DataFrame:
         normalized = bars.copy()
-        normalized["time"] = normalized["datetime"].astype("int64") // 10**9
+        base_times = (normalized["datetime"].astype("int64") // 10**9).tolist()
+        adjusted_times: list[int] = []
+        previous_time: int | None = None
+        for base_time in base_times:
+            chart_time = int(base_time)
+            if previous_time is not None and chart_time <= previous_time:
+                chart_time = previous_time + 1
+            adjusted_times.append(chart_time)
+            previous_time = chart_time
+        normalized["time"] = adjusted_times
+        normalized["display_time"] = normalized["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         return normalized
 
     @staticmethod
@@ -179,6 +227,10 @@ class MarketDataService:
             }
             for row in df[["time", "open", "close", "volume"]].itertuples(index=False)
         ]
+
+    @staticmethod
+    def _serialize_time_labels(df: pd.DataFrame) -> dict[str, str]:
+        return {str(int(row.time)): str(row.display_time) for row in df[["time", "display_time"]].itertuples(index=False)}
 
     @staticmethod
     def _serialize_indicator(result: IndicatorResult) -> dict[str, Any]:

@@ -103,7 +103,8 @@ body {
 
 .control-field input:focus,
 .control-field select:focus,
-.indicator-param input:focus {
+.indicator-param input:focus,
+.indicator-param select:focus {
   outline: 2px solid rgba(162, 79, 47, 0.16);
   border-color: rgba(162, 79, 47, 0.42);
 }
@@ -184,7 +185,8 @@ body {
   font-size: 11px;
 }
 
-.indicator-param input {
+.indicator-param input,
+.indicator-param select {
   width: 100%;
   margin-top: 0;
   padding: 8px 10px;
@@ -195,7 +197,15 @@ body {
   font-size: 13px;
 }
 
-.indicator-param input:disabled {
+.indicator-param input[type="checkbox"] {
+  width: auto;
+  justify-self: start;
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.indicator-param input:disabled,
+.indicator-param select:disabled {
   opacity: 0.55;
 }
 

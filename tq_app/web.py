@@ -30,13 +30,18 @@ def create_app(service: MarketDataService, project_root: Path) -> Flask:
         indicator_params_raw = request.args.get("indicator_params", "")
         symbol = request.args.get("symbol", "").strip() or None
         duration_raw = request.args.get("duration_seconds", "").strip()
+        bar_mode = request.args.get("bar_mode", "").strip() or None
+        range_ticks_raw = request.args.get("range_ticks", "").strip()
         indicator_ids = [item.strip() for item in indicator_param.split(",") if item.strip()]
         indicator_params: dict[str, dict[str, Any]] | None = None
         duration_seconds: int | None = None
+        range_ticks: int | None = None
         if indicator_params_raw:
             indicator_params = json.loads(indicator_params_raw)
         if duration_raw:
             duration_seconds = int(duration_raw)
+        if range_ticks_raw:
+            range_ticks = int(range_ticks_raw)
         try:
             return jsonify(
                 service.get_snapshot(
@@ -44,6 +49,8 @@ def create_app(service: MarketDataService, project_root: Path) -> Flask:
                     indicator_params,
                     symbol=symbol,
                     duration_seconds=duration_seconds,
+                    bar_mode=bar_mode,
+                    range_ticks=range_ticks,
                 )
             )
         except Exception as exc:

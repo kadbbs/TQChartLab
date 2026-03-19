@@ -17,6 +17,8 @@ DEFAULT_DATA_LENGTH = 800
 DEFAULT_REFRESH_MS = 800
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8050
+DEFAULT_BAR_MODE = "time"
+DEFAULT_RANGE_TICKS = 10
 
 
 class ServerThread(threading.Thread):
@@ -40,6 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration", type=int, default=DEFAULT_DURATION_SECONDS, help="K 线周期，单位秒")
     parser.add_argument("--length", type=int, default=DEFAULT_DATA_LENGTH, help="拉取 K 线数量")
     parser.add_argument("--refresh-ms", type=int, default=DEFAULT_REFRESH_MS, help="刷新间隔，单位毫秒")
+    parser.add_argument(
+        "--bar-mode",
+        default=DEFAULT_BAR_MODE,
+        choices=["time", "tick", "range", "renko"],
+        help="图表类型: time / tick / range / renko",
+    )
+    parser.add_argument(
+        "--range-ticks",
+        type=int,
+        default=DEFAULT_RANGE_TICKS,
+        help="Range Bar / Renko 的价格跨度，单位 tick",
+    )
     parser.add_argument("--host", default=DEFAULT_HOST, help="监听地址")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="监听端口")
     parser.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
@@ -56,6 +70,8 @@ def main() -> None:
         data_length=args.length,
         refresh_ms=args.refresh_ms,
         project_root=project_root,
+        bar_mode=args.bar_mode,
+        range_ticks=args.range_ticks,
     )
     service.start()
 
