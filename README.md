@@ -13,6 +13,8 @@
 - 前端输入指标参数，后端实时计算
 - 自定义指标动态加载
 - 合约代码到可读名称的映射
+- 页面内直接切换 `tq / duckdb`
+- DuckDB 本地回放覆盖范围展示
 
 ## 界面示例
 
@@ -26,11 +28,13 @@
 
 - 主图显示 K 线和成交量
 - 副图显示 MACD、STC 等指标
-- 合约列表来自天勤合约目录，前端显示友好名称
+- 主图支持 `时间 K 线 / Tick / Range / Renko`
+- 合约列表支持友好名称映射，`duckdb` 下优先使用本地已归档合约
 - 指标参数在前端可编辑，修改后重新请求后端计算
-- 前 200 根 K 线只参与计算，不参与显示，避免指标预热阶段把价格轴压坏
+- 指标预热阶段的数据只参与计算，显示会从指标形成有效值后开始
 - 多图表时间范围联动
 - 十字光标在 K 线和指标面板之间联动
+- `duckdb` 本地源下自动关闭轮询刷新，适合历史回放
 
 ## 项目结构
 
@@ -118,9 +122,13 @@ http://127.0.0.1:8050
 
 ```bash
 ./myvenv/bin/python web_tq_chart.py \
+  --provider duckdb \
   --symbol DCE.v2609 \
   --duration 300 \
   --length 800 \
+  --bar-mode tick \
+  --range-ticks 10 \
+  --brick-length 10000 \
   --refresh-ms 800 \
   --host 0.0.0.0 \
   --port 8050
@@ -132,6 +140,9 @@ http://127.0.0.1:8050
 - `--symbol` 默认合约，例如 `DCE.v2609`
 - `--duration` K 线周期，单位秒
 - `--length` 拉取 K 线数量
+- `--bar-mode` 图表类型，支持 `time / tick / range / renko`
+- `--range-ticks` Range Bar / Renko 价格跨度，单位 tick
+- `--brick-length` Tick / Range / Renko 默认显示根数
 - `--refresh-ms` 刷新间隔，单位毫秒
 - `--host` 监听地址
 - `--port` 监听端口
@@ -169,6 +180,8 @@ http://127.0.0.1:8050
 
 - `EMA55`
 - `STC`
+- `Hull Suite`
+- `多空线`
 
 ## 自定义指标
 
@@ -219,6 +232,14 @@ period = resolved["period"]
 - `duckdb`
   使用本地 DuckDB tick 库回放，适合历史分析、Range Bar、Renko 和脱机使用
 
+当前 `duckdb` 数据源的行为是：
+
+- 真实持久化落库的是 `tick` 明细
+- `时间 K 线` 会按 `duration_seconds` 从本地 tick 聚合
+- `Tick 图` 会从本地 tick 重建展示序列
+- `Range / Renko` 会按当前参数从本地 tick 即时合成
+- 同一组参数请求会使用数据库文件签名缓存，避免反复全量重算
+
 如果后面要接别的数据源，思路是：
 
 1. 在 `tq_app/data_sources/` 下新增一个 `DataSource` 实现
@@ -241,6 +262,12 @@ period = resolved["period"]
   存所有 tick 明细，按 `provider + symbol + ts_nano` 去重
 - `contract_metadata`
   存合约映射、名称、到期月、最小变动、乘数等元信息
+
+设计原则：
+
+- tick 明细统一存一张事实表，方便后续聚合任意周期和砖图
+- 合约元信息单独存表，避免业务展示和原始 tick 耦合
+- 数据源和存储层解耦，后续新增 provider 时不需要改前端
 
 历史回灌脚本：
 
@@ -359,7 +386,9 @@ PY
 
 - 当前数据源
 - 默认合约
+- 合约友好名称与本地覆盖信息
 - 周期选项
+- 图表类型选项
 - 合约列表
 - 指标元信息
 - 默认启用指标
@@ -368,15 +397,19 @@ PY
 
 常用参数：
 
+- `provider`
 - `symbol`
 - `duration_seconds`
+- `bar_mode`
+- `range_ticks`
+- `brick_length`
 - `indicators`
 - `indicator_params`
 
 示例：
 
 ```text
-/api/snapshot?symbol=DCE.v2609&duration_seconds=300&indicators=macd,stc
+/api/snapshot?provider=duckdb&symbol=DCE.v2609&bar_mode=renko&range_ticks=10&brick_length=3000&indicators=macd,stc
 ```
 
 ## 显示策略说明
@@ -387,6 +420,7 @@ PY
 - 不再固定隐藏前 200 根，而是优先从指标已经形成有效值之后开始显示
 - 初始视图优先显示指标已经算稳定后的区间
 - 价格轴上下会额外留白
+- `tick / range / renko` 在前端按事件轴显示，同时保留真实时间标签
 
 这能减少 ATR、STC 一类指标在预热阶段把主图压成一条横线的问题。
 
@@ -420,6 +454,16 @@ http://127.0.0.1:8050
 - 是否有语法错误
 - 是否已经重启服务
 
+### 4. DuckDB 下切换合约后没有变化
+
+优先检查这几项：
+
+- 浏览器是否还缓存着旧的 `static/app.js`
+- 当前选择的合约是否已经有本地 tick
+- 页面左侧“本地数据覆盖”卡片是否已经更新
+
+如果前端脚本已经是最新版，切换合约后标题、行情卡片和 K 线会一起更新。
+
 ## 开发建议
 
 - 指标计算尽量保留预热阶段的 `NaN`，不要轻易 `fillna(0)`
@@ -445,11 +489,11 @@ Python 编译检查：
 
 - 增加新的数据源实现
 - 合约搜索和分组筛选
-- 指标参数防抖刷新
 - 十字光标处显示 OHLC、成交量和指标值
 - 指标信号标记
 - WebSocket 推送而不是轮询
+- 常用周期预聚合或物化缓存，提高本地回放速度
 
 ## License
 
-本项目使用 MIT License，详见 [LICENSE](/home/bs/code/qh/tq/LICENSE)。
+本项目使用 MIT License，详见 [LICENSE](LICENSE)。
