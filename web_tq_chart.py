@@ -19,6 +19,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8050
 DEFAULT_BAR_MODE = "time"
 DEFAULT_RANGE_TICKS = 10
+DEFAULT_BRICK_LENGTH = 10000
 
 
 class ServerThread(threading.Thread):
@@ -37,10 +38,11 @@ class ServerThread(threading.Thread):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="天勤量化浏览器图表工作台")
-    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="数据源名称，当前支持 tq")
+    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="数据源名称，当前支持 tq / duckdb")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="合约代码，例如 DCE.v2609")
     parser.add_argument("--duration", type=int, default=DEFAULT_DURATION_SECONDS, help="K 线周期，单位秒")
     parser.add_argument("--length", type=int, default=DEFAULT_DATA_LENGTH, help="拉取 K 线数量")
+    parser.add_argument("--brick-length", type=int, default=DEFAULT_BRICK_LENGTH, help="Range Bar / Renko 保留砖块数量")
     parser.add_argument("--refresh-ms", type=int, default=DEFAULT_REFRESH_MS, help="刷新间隔，单位毫秒")
     parser.add_argument(
         "--bar-mode",
@@ -68,6 +70,7 @@ def main() -> None:
         symbol=args.symbol,
         duration_seconds=args.duration,
         data_length=args.length,
+        brick_length=args.brick_length,
         refresh_ms=args.refresh_ms,
         project_root=project_root,
         bar_mode=args.bar_mode,

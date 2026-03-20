@@ -1,9 +1,11 @@
 const state = {
   config: null,
+  activeProvider: "",
   activeSymbol: "",
   activeDurationSeconds: null,
   activeBarMode: "time",
   activeRangeTicks: 10,
+  activeBrickLength: 10000,
   selectedIndicators: [],
   indicatorParams: {},
   charts: [],
@@ -15,6 +17,9 @@ const state = {
   currentPriceLine: null,
   hasFitted: false,
   isSyncingCrosshair: false,
+  refreshTimerId: null,
+  snapshotRequestId: 0,
+  configRequestId: 0,
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
@@ -24,6 +29,30 @@ const PRICE_RANGE_TOP_PADDING = 0.1;
 const PRICE_RANGE_BOTTOM_PADDING = 0.14;
 const RENKO_DEFAULT_TICKS = 5;
 const RANGE_DEFAULT_TICKS = 10;
+
+function formatAxisTimeLabel(time) {
+  if (typeof time === "number") {
+    const exact = state.timeLabels.get(String(time));
+    if (exact) {
+      const [datePart, timePart = ""] = exact.split(" ");
+      const [, month = "", day = ""] = datePart.split("-");
+      return timePart ? `${month}-${day} ${timePart.slice(0, 5)}` : `${month}-${day}`;
+    }
+    return new Date(time * 1000).toLocaleString("zh-CN", {
+      hour12: false,
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  if (time && typeof time === "object" && "year" in time) {
+    const month = String(time.month).padStart(2, "0");
+    const day = String(time.day).padStart(2, "0");
+    return `${month}-${day}`;
+  }
+  return "";
+}
 
 class LineBandPrimitiveRenderer {
   constructor(source) {
@@ -182,6 +211,8 @@ class LineBandPrimitive {
 const els = {
   title: document.getElementById("page-title"),
   provider: document.getElementById("provider-name"),
+  providerSelect: document.getElementById("provider-select"),
+  providerHint: document.getElementById("provider-hint"),
   symbol: document.getElementById("symbol-name"),
   duration: document.getElementById("duration-name"),
   symbolSelect: document.getElementById("symbol-select"),
@@ -189,9 +220,18 @@ const els = {
   durationSelect: document.getElementById("duration-select"),
   barSizeLabel: document.getElementById("bar-size-label"),
   rangeTicksInput: document.getElementById("range-ticks-input"),
+  historySizeLabel: document.getElementById("history-size-label"),
+  brickLengthInput: document.getElementById("brick-length-input"),
   lastPrice: document.getElementById("last-price"),
   lastUpdate: document.getElementById("last-update"),
   cursorTime: document.getElementById("cursor-time"),
+  contractDetailCard: document.getElementById("contract-detail-card"),
+  detailFirstTick: document.getElementById("detail-first-tick"),
+  detailLastTick: document.getElementById("detail-last-tick"),
+  detailTickCount: document.getElementById("detail-tick-count"),
+  detailPriceTick: document.getElementById("detail-price-tick"),
+  detailContractMonth: document.getElementById("detail-contract-month"),
+  detailVolumeMultiple: document.getElementById("detail-volume-multiple"),
   indicatorForm: document.getElementById("indicator-form"),
   chartStack: document.getElementById("chart-stack"),
   error: document.getElementById("error-message"),
@@ -231,6 +271,7 @@ const chartTheme = {
     minBarSpacing: 4,
     tickMarkMaxCharacterLength: 18,
     ticksVisible: true,
+    tickMarkFormatter: (time) => formatAxisTimeLabel(time),
   },
   handleScroll: {
     mouseWheel: true,
@@ -367,6 +408,50 @@ function syncMarketHeader(symbolLabel, durationSeconds, barMode, rangeTicks) {
   els.duration.textContent = formatBarModeLabel(barMode, durationSeconds, rangeTicks);
 }
 
+function formatDetailValue(value, fallback = "--") {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  const text = String(value).trim();
+  return text ? text : fallback;
+}
+
+function formatNumberValue(value, digits = null) {
+  if (value === null || value === undefined || value === "") {
+    return "--";
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "--";
+  }
+  if (digits === null) {
+    return number.toLocaleString("zh-CN");
+  }
+  return number.toLocaleString("zh-CN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+function renderProviderMeta(payload) {
+  const provider = payload.provider || state.activeProvider || state.config?.provider || "";
+  els.provider.textContent = provider || "--";
+  els.providerHint.textContent = payload.provider_hint || "当前数据源暂无额外说明。";
+
+  const detail = payload.contract_detail || {};
+  const hasLocalCoverage =
+    provider === "duckdb" &&
+    (detail.first_tick_at || detail.last_tick_at || Number(detail.tick_count || 0) > 0);
+
+  els.contractDetailCard.hidden = !hasLocalCoverage;
+  els.detailFirstTick.textContent = formatDetailValue(detail.first_tick_at);
+  els.detailLastTick.textContent = formatDetailValue(detail.last_tick_at);
+  els.detailTickCount.textContent = formatNumberValue(detail.tick_count);
+  els.detailPriceTick.textContent = formatNumberValue(detail.price_tick, 4);
+  els.detailContractMonth.textContent = formatDetailValue(detail.contract_month);
+  els.detailVolumeMultiple.textContent = formatNumberValue(detail.volume_multiple, 0);
+}
+
 function buildDurationOptions(options, activeValue) {
   els.durationSelect.innerHTML = "";
   options.forEach((seconds) => {
@@ -375,6 +460,17 @@ function buildDurationOptions(options, activeValue) {
     option.textContent = formatDurationLabel(seconds);
     option.selected = seconds === activeValue;
     els.durationSelect.append(option);
+  });
+}
+
+function buildProviderOptions(options, activeValue) {
+  els.providerSelect.innerHTML = "";
+  options.forEach((providerId) => {
+    const option = document.createElement("option");
+    option.value = providerId;
+    option.textContent = providerId;
+    option.selected = providerId === activeValue;
+    els.providerSelect.append(option);
   });
 }
 
@@ -391,20 +487,28 @@ function buildBarModeOptions(options, activeValue) {
 
 function buildContractOptions(contracts, activeSymbol) {
   els.symbolSelect.innerHTML = "";
+  const provider = getRequestedProvider() || state.activeProvider || state.config?.provider || "";
   const normalizedContracts = contracts.length
     ? contracts
     : [{ symbol: activeSymbol, label: activeSymbol }];
   normalizedContracts.forEach((contract) => {
     const option = document.createElement("option");
     option.value = contract.symbol;
-    option.textContent = contract.label;
+    const tickCount = Number(contract.tick_count || 0);
+    const hasLocalTicks = provider !== "duckdb" || tickCount > 0;
+    option.textContent = hasLocalTicks ? contract.label : `${contract.label}（无本地数据）`;
+    option.disabled = !hasLocalTicks;
     option.selected = contract.symbol === activeSymbol;
     els.symbolSelect.append(option);
   });
 }
 
 function getRequestedSymbol() {
-  return els.symbolSelect.value || state.config.symbol;
+  return els.symbolSelect.value || state.activeSymbol || state.config.symbol;
+}
+
+function getRequestedProvider() {
+  return els.providerSelect.value || state.config.provider;
 }
 
 function getRequestedDuration() {
@@ -420,6 +524,11 @@ function getRequestedRangeTicks() {
   return Number.isFinite(value) && value > 0 ? Math.round(value) : 10;
 }
 
+function getRequestedBrickLength() {
+  const value = Number(els.brickLengthInput.value || state.config.brick_length || 10000);
+  return Number.isFinite(value) && value > 0 ? Math.round(value) : 10000;
+}
+
 function defaultTicksForBarMode(barMode) {
   if (barMode === "renko") {
     return RENKO_DEFAULT_TICKS;
@@ -433,14 +542,22 @@ function defaultTicksForBarMode(barMode) {
 function syncBarModeControls(barMode) {
   const usesDuration = barMode === "time";
   const usesTicks = barMode === "range" || barMode === "renko";
+  const usesHistoryLength = barMode === "tick" || barMode === "range" || barMode === "renko";
   els.durationSelect.disabled = !usesDuration;
   els.rangeTicksInput.disabled = !usesTicks;
+  els.brickLengthInput.disabled = !usesHistoryLength;
   if (barMode === "renko") {
     els.barSizeLabel.textContent = "Renko Tick";
+    els.historySizeLabel.textContent = "砖图根数";
   } else if (barMode === "range") {
     els.barSizeLabel.textContent = "Range Tick";
+    els.historySizeLabel.textContent = "砖图根数";
+  } else if (barMode === "tick") {
+    els.barSizeLabel.textContent = "价格 Tick";
+    els.historySizeLabel.textContent = "Tick 根数";
   } else {
     els.barSizeLabel.textContent = "价格 Tick";
+    els.historySizeLabel.textContent = "显示根数";
   }
 }
 
@@ -889,21 +1006,33 @@ function applySnapshot(snapshot) {
   els.error.textContent = "";
   const nextBarMode = snapshot.bar_mode || "time";
   const nextRangeTicks = snapshot.range_ticks || state.config.range_ticks || 10;
+  const nextBrickLength = snapshot.brick_length || state.config.brick_length || 10000;
   const shouldRefit =
     snapshot.symbol !== state.activeSymbol ||
     snapshot.duration_seconds !== state.activeDurationSeconds ||
     nextBarMode !== state.activeBarMode ||
-    nextRangeTicks !== state.activeRangeTicks;
+    nextRangeTicks !== state.activeRangeTicks ||
+    nextBrickLength !== state.activeBrickLength;
 
   state.activeSymbol = snapshot.symbol;
+  state.activeProvider = snapshot.provider || state.config.provider;
   state.activeDurationSeconds = snapshot.duration_seconds;
   state.activeBarMode = nextBarMode;
   state.activeRangeTicks = nextRangeTicks;
+  state.activeBrickLength = nextBrickLength;
+  state.config.symbol = snapshot.symbol;
+  state.config.provider = state.activeProvider;
+  state.config.duration_seconds = snapshot.duration_seconds;
+  state.config.bar_mode = nextBarMode;
+  state.config.range_ticks = nextRangeTicks;
+  state.config.brick_length = nextBrickLength;
   state.timeLabels = new Map(Object.entries(snapshot.time_labels || {}));
   els.symbolSelect.value = snapshot.symbol;
+  els.providerSelect.value = state.activeProvider;
   els.barModeSelect.value = state.activeBarMode;
   els.durationSelect.value = String(snapshot.duration_seconds);
   els.rangeTicksInput.value = String(state.activeRangeTicks);
+  els.brickLengthInput.value = String(state.activeBrickLength);
   syncBarModeControls(state.activeBarMode);
   syncMarketHeader(
     snapshot.symbol_label || snapshot.symbol,
@@ -911,6 +1040,7 @@ function applySnapshot(snapshot) {
     state.activeBarMode,
     state.activeRangeTicks
   );
+  renderProviderMeta(snapshot);
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;
@@ -1006,11 +1136,14 @@ function applySnapshot(snapshot) {
 }
 
 async function refreshSnapshot() {
+  const requestId = ++state.snapshotRequestId;
   const params = new URLSearchParams();
+  params.set("provider", getRequestedProvider());
   params.set("symbol", getRequestedSymbol());
   params.set("duration_seconds", String(getRequestedDuration()));
   params.set("bar_mode", getRequestedBarMode());
   params.set("range_ticks", String(getRequestedRangeTicks()));
+  params.set("brick_length", String(getRequestedBrickLength()));
   if (state.selectedIndicators.length) {
     params.set("indicators", state.selectedIndicators.join(","));
     const selectedParams = {};
@@ -1021,7 +1154,58 @@ async function refreshSnapshot() {
   }
   const query = params.toString();
   const snapshot = await fetchJson(`/api/snapshot${query ? `?${query}` : ""}`);
+  if (requestId !== state.snapshotRequestId) {
+    return;
+  }
   applySnapshot(snapshot);
+  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+}
+
+async function refreshConfig(provider) {
+  const requestId = ++state.configRequestId;
+  const params = new URLSearchParams();
+  if (provider) {
+    params.set("provider", provider);
+  }
+  const query = params.toString();
+  const nextConfig = await fetchJson(`/api/config${query ? `?${query}` : ""}`);
+  if (requestId !== state.configRequestId) {
+    return;
+  }
+  state.config = nextConfig;
+  state.activeProvider = nextConfig.provider;
+  state.activeSymbol = nextConfig.symbol;
+  state.activeBrickLength = nextConfig.brick_length || state.activeBrickLength || 10000;
+  buildProviderOptions(nextConfig.providers || [], nextConfig.provider);
+  buildContractOptions(nextConfig.contracts || [], nextConfig.symbol);
+  buildBarModeOptions(nextConfig.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
+  buildDurationOptions(nextConfig.duration_options || [nextConfig.duration_seconds], nextConfig.duration_seconds);
+  els.brickLengthInput.value = String(state.activeBrickLength);
+  syncMarketHeader(
+    nextConfig.symbol_label || nextConfig.symbol,
+    nextConfig.duration_seconds,
+    state.activeBarMode,
+    state.activeRangeTicks
+  );
+  renderProviderMeta(nextConfig);
+  syncAutoRefresh(nextConfig.refresh_ms ?? 0);
+}
+
+function syncAutoRefresh(refreshMs) {
+  if (state.refreshTimerId) {
+    window.clearInterval(state.refreshTimerId);
+    state.refreshTimerId = null;
+  }
+  if (!Number.isFinite(refreshMs) || refreshMs <= 0) {
+    return;
+  }
+  state.refreshTimerId = window.setInterval(async () => {
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  }, refreshMs);
 }
 
 function resizeCharts() {
@@ -1035,19 +1219,23 @@ function resizeCharts() {
 
 async function boot() {
   state.config = await fetchJson("/api/config");
+  state.activeProvider = state.config.provider;
   state.activeSymbol = state.config.symbol;
   state.activeDurationSeconds = state.config.duration_seconds;
   state.activeBarMode = state.config.bar_mode || "time";
   state.activeRangeTicks = state.config.range_ticks || 10;
+  state.activeBrickLength = state.config.brick_length || 10000;
   state.timeLabels = new Map();
   state.selectedIndicators = [...state.config.default_indicator_ids];
   state.indicatorParams = getDefaultIndicatorParams(state.config.indicators);
 
   els.provider.textContent = state.config.provider;
+  buildProviderOptions(state.config.providers || [state.config.provider], state.config.provider);
   buildContractOptions(state.config.contracts || [], state.config.symbol);
   buildBarModeOptions(state.config.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
   buildDurationOptions(state.config.duration_options || [state.config.duration_seconds], state.config.duration_seconds);
   els.rangeTicksInput.value = String(state.activeRangeTicks);
+  els.brickLengthInput.value = String(state.activeBrickLength);
   syncBarModeControls(state.activeBarMode);
   syncMarketHeader(
     state.config.symbol_label || state.config.symbol,
@@ -1055,9 +1243,22 @@ async function boot() {
     state.activeBarMode,
     state.activeRangeTicks
   );
+  renderProviderMeta(state.config);
 
   els.symbolSelect.addEventListener("change", async () => {
     try {
+      state.activeSymbol = getRequestedSymbol();
+      state.config.symbol = state.activeSymbol;
+      els.error.textContent = "";
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
+  els.providerSelect.addEventListener("change", async () => {
+    const nextProvider = getRequestedProvider();
+    try {
+      await refreshConfig(nextProvider);
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
@@ -1094,17 +1295,17 @@ async function boot() {
       els.error.textContent = error.message;
     }
   });
-
-  buildIndicatorSelector(state.config.indicators, state.config.default_indicator_ids);
-  rebuildCharts();
-  await refreshSnapshot();
-  setInterval(async () => {
+  els.brickLengthInput.addEventListener("change", async () => {
     try {
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
     }
-  }, state.config.refresh_ms);
+  });
+
+  buildIndicatorSelector(state.config.indicators, state.config.default_indicator_ids);
+  rebuildCharts();
+  await refreshSnapshot();
 }
 
 window.addEventListener("resize", resizeCharts);

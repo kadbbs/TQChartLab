@@ -18,6 +18,10 @@
         <div class="panel-label">行情</div>
         <div class="control-grid">
           <label class="control-field">
+            <span>数据源切换</span>
+            <select id="provider-select"></select>
+          </label>
+          <label class="control-field">
             <span>合约切换</span>
             <select id="symbol-select"></select>
           </label>
@@ -33,6 +37,10 @@
             <span id="bar-size-label">Range Tick</span>
             <input id="range-ticks-input" type="number" min="1" step="1" />
           </label>
+          <label class="control-field">
+            <span id="history-size-label">显示根数</span>
+            <input id="brick-length-input" type="number" min="100" step="100" />
+          </label>
         </div>
         <div class="field"><span>数据源</span><strong id="provider-name">--</strong></div>
         <div class="field"><span>合约</span><strong id="symbol-name">--</strong></div>
@@ -40,6 +48,36 @@
         <div class="field"><span>最新价</span><strong id="last-price">--</strong></div>
         <div class="field"><span>更新时间</span><strong id="last-update">--</strong></div>
         <div class="field"><span>光标时间</span><strong id="cursor-time">--</strong></div>
+        <div id="provider-hint" class="subhint">--</div>
+        <div id="contract-detail-card" class="detail-card">
+          <div class="detail-card-title">本地数据覆盖</div>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span>起始时间</span>
+              <strong id="detail-first-tick">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>结束时间</span>
+              <strong id="detail-last-tick">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>Tick 数量</span>
+              <strong id="detail-tick-count">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>最小变动</span>
+              <strong id="detail-price-tick">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>合约月</span>
+              <strong id="detail-contract-month">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>交易乘数</span>
+              <strong id="detail-volume-multiple">--</strong>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="panel">
         <div class="panel-label">指标</div>

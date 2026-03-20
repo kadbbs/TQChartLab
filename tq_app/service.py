@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from tq_app.contracts import format_contract_label, load_tq_contract_catalog
+from tq_app.contracts import format_contract_label, load_duckdb_contract_catalog, load_tq_contract_catalog
 from tq_app.data_sources import DataSource, create_data_source, get_available_data_sources
 from tq_app.indicators import build_indicator_registry
 from tq_app.models import IndicatorMeta, IndicatorResult
@@ -22,6 +22,7 @@ DEFAULT_BAR_MODES = [
     {"id": "renko", "label": "Renko"},
 ]
 DEFAULT_RANGE_TICKS = 10
+DEFAULT_BRICK_LENGTH = 10000
 
 
 class MarketDataService:
@@ -33,6 +34,7 @@ class MarketDataService:
         data_length: int,
         refresh_ms: int,
         project_root: Path,
+        brick_length: int = DEFAULT_BRICK_LENGTH,
         bar_mode: str = "time",
         range_ticks: int = DEFAULT_RANGE_TICKS,
     ) -> None:
@@ -40,18 +42,18 @@ class MarketDataService:
         self.symbol = symbol
         self.duration_seconds = duration_seconds
         self.data_length = data_length
+        self.brick_length = brick_length
         self.refresh_ms = refresh_ms
         self.project_root = project_root
         self.bar_mode = bar_mode
         self.range_ticks = range_ticks
         self._source_lock = threading.Lock()
-        self._data_sources: dict[tuple[str, int, str, int], DataSource] = {}
-        self.contracts = self._load_contracts()
-        self._contract_map = {item["symbol"]: item for item in self.contracts}
+        self._data_sources: dict[tuple[str, str, int, str, int, int], DataSource] = {}
+        self._contracts_by_provider: dict[str, list[dict[str, Any]]] = {}
         self.indicators = build_indicator_registry(project_root)
 
     def start(self) -> None:
-        self._get_data_source(self.symbol, self.duration_seconds, self.bar_mode, self.range_ticks)
+        self._get_data_source(self.provider, self.symbol, self.duration_seconds, self.bar_mode, self.range_ticks, self.brick_length)
 
     def stop(self) -> None:
         with self._source_lock:
@@ -60,21 +62,32 @@ class MarketDataService:
         for data_source in data_sources:
             data_source.stop()
 
-    def get_config(self) -> dict[str, Any]:
+    def get_config(self, provider: str | None = None) -> dict[str, Any]:
+        effective_provider = self._resolve_provider(provider)
+        contracts = self._load_contracts(effective_provider)
+        default_symbol = self._default_symbol_for_provider(effective_provider)
+        selected_symbol = default_symbol
+        current_contract = next((item for item in contracts if item["symbol"] == self.symbol), None)
+        if current_contract is not None:
+            if effective_provider != "duckdb" or int(current_contract.get("tick_count", 0) or 0) > 0:
+                selected_symbol = self.symbol
         indicator_meta = [asdict(meta) for meta in self.indicators.list_meta()]
         return {
-            "provider": self.provider,
+            "provider": effective_provider,
             "providers": get_available_data_sources(),
-            "symbol": self.symbol,
-            "symbol_label": self._symbol_label(self.symbol),
+            "symbol": selected_symbol,
+            "symbol_label": self._symbol_label(effective_provider, selected_symbol),
+            "provider_hint": self._provider_hint(effective_provider),
+            "contract_detail": self._contract_detail(effective_provider, selected_symbol),
             "duration_seconds": self.duration_seconds,
             "duration_options": DEFAULT_DURATION_OPTIONS,
             "bar_mode": self.bar_mode,
             "bar_modes": DEFAULT_BAR_MODES,
             "range_ticks": self.range_ticks,
             "data_length": self.data_length,
-            "refresh_ms": self.refresh_ms,
-            "contracts": self.contracts,
+            "brick_length": self.brick_length,
+            "refresh_ms": self._refresh_interval_ms(effective_provider),
+            "contracts": contracts,
             "indicators": indicator_meta,
             "default_indicator_ids": self.indicators.default_ids(),
         }
@@ -87,18 +100,24 @@ class MarketDataService:
         duration_seconds: int | None = None,
         bar_mode: str | None = None,
         range_ticks: int | None = None,
+        brick_length: int | None = None,
+        provider: str | None = None,
     ) -> dict[str, Any]:
-        effective_symbol = (symbol or self.symbol).strip()
+        effective_provider = self._resolve_provider(provider)
+        effective_symbol = (symbol or self._default_symbol_for_provider(effective_provider)).strip()
         effective_duration = duration_seconds or self.duration_seconds
         effective_bar_mode = (bar_mode or self.bar_mode).strip() or "time"
         effective_range_ticks = range_ticks or self.range_ticks
+        effective_brick_length = brick_length or self.brick_length
         bars = self._get_data_source(
+            effective_provider,
             effective_symbol,
             effective_duration,
             effective_bar_mode,
             effective_range_ticks,
+            effective_brick_length,
         ).get_bars()
-        normalized = self._with_chart_time(bars)
+        normalized = self._with_chart_time(bars, effective_bar_mode)
         selected = indicator_ids or self.indicators.default_ids()
         all_params = indicator_params or {}
 
@@ -113,11 +132,15 @@ class MarketDataService:
 
         return {
             "symbol": effective_symbol,
-            "symbol_label": self._symbol_label(effective_symbol),
-            "provider": self.provider,
+            "symbol_label": self._symbol_label(effective_provider, effective_symbol),
+            "provider": effective_provider,
+            "provider_hint": self._provider_hint(effective_provider),
+            "refresh_ms": self._refresh_interval_ms(effective_provider),
+            "contract_detail": self._contract_detail(effective_provider, effective_symbol),
             "duration_seconds": effective_duration,
             "bar_mode": effective_bar_mode,
             "range_ticks": effective_range_ticks,
+            "brick_length": effective_brick_length,
             "time_labels": self._serialize_time_labels(normalized),
             "candles": self._serialize_candles(normalized),
             "volume": self._serialize_volume(normalized),
@@ -127,40 +150,53 @@ class MarketDataService:
             "last_time": normalized.iloc[-1]["datetime"].strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    def _load_contracts(self) -> list[dict[str, Any]]:
-        if self.provider != "tq":
-            return []
-        try:
-            contracts = load_tq_contract_catalog(self.project_root)
-        except Exception:
+    def _load_contracts(self, provider: str) -> list[dict[str, Any]]:
+        cached = self._contracts_by_provider.get(provider)
+        if cached is not None:
+            return cached
+
+        if provider == "tq":
+            try:
+                contracts = load_tq_contract_catalog(self.project_root)
+            except Exception:
+                contracts = []
+        elif provider == "duckdb":
+            try:
+                contracts = load_duckdb_contract_catalog(self.project_root)
+            except Exception:
+                contracts = []
+        else:
             contracts = []
 
-        if any(item["symbol"] == self.symbol for item in contracts):
-            return contracts
+        if not any(item["symbol"] == self.symbol for item in contracts):
+            contracts = [
+                {
+                    "symbol": self.symbol,
+                    "name": self.symbol,
+                    "label": format_contract_label(self.symbol),
+                    "exchange_id": "",
+                    "product_id": "",
+                },
+                *contracts,
+            ]
+        self._contracts_by_provider[provider] = contracts
+        return contracts
 
-        return [
-            {
-                "symbol": self.symbol,
-                "name": self.symbol,
-                "label": format_contract_label(self.symbol),
-                "exchange_id": "",
-                "product_id": "",
-            },
-            *contracts,
-        ]
-
-    def _symbol_label(self, symbol: str) -> str:
-        contract = self._contract_map.get(symbol)
+    def _symbol_label(self, provider: str, symbol: str) -> str:
+        contract_map = {item["symbol"]: item for item in self._load_contracts(provider)}
+        contract = contract_map.get(symbol)
         if contract:
             return str(contract["label"])
         return format_contract_label(symbol)
 
     def _get_data_source(
         self,
+        provider: str,
         symbol: str,
         duration_seconds: int,
         bar_mode: str,
         range_ticks: int,
+        brick_length: int,
     ) -> DataSource:
         if not symbol:
             raise ValueError("合约不能为空。")
@@ -170,16 +206,19 @@ class MarketDataService:
             raise ValueError("周期必须大于 0 秒。")
         if range_ticks <= 0:
             raise ValueError("Range Tick 必须大于 0。")
+        if brick_length <= 0:
+            raise ValueError("Brick Length 必须大于 0。")
 
-        key = (symbol, duration_seconds, bar_mode, range_ticks)
+        key = (provider, symbol, duration_seconds, bar_mode, range_ticks, brick_length)
         with self._source_lock:
             data_source = self._data_sources.get(key)
             if data_source is None:
                 data_source = create_data_source(
-                    provider=self.provider,
+                    provider=provider,
                     symbol=symbol,
                     duration_seconds=duration_seconds,
                     data_length=self.data_length,
+                    brick_length=brick_length,
                     refresh_ms=self.refresh_ms,
                     bar_mode=bar_mode,
                     range_ticks=range_ticks,
@@ -188,18 +227,59 @@ class MarketDataService:
                 self._data_sources[key] = data_source
             return data_source
 
+    def _resolve_provider(self, provider: str | None) -> str:
+        candidate = (provider or self.provider).strip()
+        if candidate not in get_available_data_sources():
+            names = ", ".join(get_available_data_sources())
+            raise ValueError(f"未知数据源: {candidate}，可选值: {names}")
+        return candidate
+
+    def _default_symbol_for_provider(self, provider: str) -> str:
+        contracts = self._load_contracts(provider)
+        if provider == "duckdb":
+            first_with_ticks = next((item for item in contracts if int(item.get("tick_count", 0) or 0) > 0), None)
+            if first_with_ticks:
+                return str(first_with_ticks["symbol"])
+        if contracts:
+            return str(contracts[0]["symbol"])
+        return self.symbol
+
+    def _contract_detail(self, provider: str, symbol: str) -> dict[str, Any]:
+        contracts = self._load_contracts(provider)
+        contract = next((item for item in contracts if item["symbol"] == symbol), None)
+        if not contract:
+            return {}
+        return dict(contract)
+
     @staticmethod
-    def _with_chart_time(bars: pd.DataFrame) -> pd.DataFrame:
+    def _provider_hint(provider: str) -> str:
+        if provider == "duckdb":
+            return "当前使用本地 DuckDB 回放库。合约列表优先展示本地已归档的合约，若只有元信息也会显示；时间 K 线、Tick、Range、Renko 都基于本地 tick 重建。"
+        if provider == "tq":
+            return "当前使用天勤在线行情。合约目录来自天勤，图表会按在线数据实时刷新。"
+        return ""
+
+    def _refresh_interval_ms(self, provider: str) -> int:
+        if provider == "duckdb":
+            return 0
+        return self.refresh_ms
+
+    @staticmethod
+    def _with_chart_time(bars: pd.DataFrame, bar_mode: str) -> pd.DataFrame:
         normalized = bars.copy()
         base_times = (normalized["datetime"].astype("int64") // 10**9).tolist()
-        adjusted_times: list[int] = []
-        previous_time: int | None = None
-        for base_time in base_times:
-            chart_time = int(base_time)
-            if previous_time is not None and chart_time <= previous_time:
-                chart_time = previous_time + 1
-            adjusted_times.append(chart_time)
-            previous_time = chart_time
+        if bar_mode in {"tick", "range", "renko"} and base_times:
+            start_time = int(base_times[0])
+            adjusted_times = [start_time + index for index in range(len(base_times))]
+        else:
+            adjusted_times = []
+            previous_time: int | None = None
+            for base_time in base_times:
+                chart_time = int(base_time)
+                if previous_time is not None and chart_time <= previous_time:
+                    chart_time = previous_time + 1
+                adjusted_times.append(chart_time)
+                previous_time = chart_time
         normalized["time"] = adjusted_times
         normalized["display_time"] = normalized["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         return normalized
