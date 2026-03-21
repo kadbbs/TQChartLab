@@ -46,6 +46,26 @@ class TqTickHistoryDownloader:
         while not downloader.is_finished():
             self.api.wait_update()
 
+    def download_kline_csv(
+        self,
+        symbol: str,
+        duration_seconds: int,
+        start_dt: date,
+        end_dt: date,
+        output_path: Path,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        downloader = DataDownloader(
+            api=self.api,
+            symbol_list=symbol,
+            dur_sec=duration_seconds,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            csv_file_name=str(output_path),
+        )
+        while not downloader.is_finished():
+            self.api.wait_update()
+
     def query_futures_contracts(
         self,
         exchange_id: str,

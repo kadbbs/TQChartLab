@@ -254,7 +254,7 @@ class MarketDataService:
     @staticmethod
     def _provider_hint(provider: str) -> str:
         if provider == "duckdb":
-            return "当前使用本地 DuckDB 回放库。合约列表优先展示本地已归档的合约，若只有元信息也会显示；时间 K 线、Tick、Range、Renko 都基于本地 tick 重建。"
+            return "当前使用本地 DuckDB 回放库。系统会优先使用最接近的本地现成数据源；例如 5 分钟 K 线会优先读取 market_bars_5m，缺失时再回退到本地 tick 重建。"
         if provider == "tq":
             return "当前使用天勤在线行情。合约目录来自天勤，图表会按在线数据实时刷新。"
         return ""

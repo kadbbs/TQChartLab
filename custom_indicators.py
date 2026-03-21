@@ -20,6 +20,37 @@ def _line_data(df: pd.DataFrame, column: str) -> list[dict[str, float | int | No
     ]
 
 
+def _colored_line_data(
+    df: pd.DataFrame,
+    value_column: str,
+    trend_column: str,
+    up_color: str,
+    down_color: str,
+) -> list[dict[str, float | int | str]]:
+    points: list[dict[str, float | int | str]] = []
+
+    for row in df[["time", value_column, trend_column]].itertuples(index=False):
+        value = getattr(row, value_column)
+        trend = getattr(row, trend_column)
+        if pd.isna(value):
+            points.append({"time": int(row.time)})
+            continue
+
+        color = up_color
+        if not pd.isna(trend) and not bool(trend):
+            color = down_color
+
+        points.append(
+            {
+                "time": int(row.time),
+                "value": float(value),
+                "color": color,
+            }
+        )
+
+    return points
+
+
 def _trend_line_data(
     df: pd.DataFrame,
     value_column: str,
@@ -39,7 +70,6 @@ def _trend_line_data(
         points.append(_line_point(int(row.time), value if trend is bullish else None))
 
     return points
-
 
 def _wma(series: pd.Series, period: int) -> pd.Series:
     safe_period = max(int(period), 1)
@@ -317,7 +347,7 @@ class DuoKongLineIndicator(Indicator):
         id="duo_kong_line",
         name="多空线",
         pane="price",
-        description="HULL 多空线，单线红绿切换，并标注 多 / 空 信号。",
+        description="通达信风格 HULL 多空线，白色主线叠加红绿趋势段，并标注 多 / 空 信号。",
         enabled_by_default=False,
         params=[
             {
@@ -360,9 +390,11 @@ class DuoKongLineIndicator(Indicator):
         else:
             df["hull"] = _hma(hull_source, length)
 
-        df["trend_up"] = df["hull"] >= df["hull"].shift(1)
-        df["buy_signal"] = (df["hull"] > df["hull"].shift(1)) & (df["hull"].shift(1) <= df["hull"].shift(2))
-        df["sell_signal"] = (df["hull"] < df["hull"].shift(1)) & (df["hull"].shift(1) >= df["hull"].shift(2))
+        previous_hull = df["hull"].shift(1)
+        slope = df["hull"] - previous_hull
+        df["trend_up"] = df["hull"] >= previous_hull
+        df["buy_signal"] = (slope > 0) & (slope.shift(1) <= 0)
+        df["sell_signal"] = (slope < 0) & (slope.shift(1) >= 0)
 
         markers: list[dict[str, str | int]] = []
         if show_signals:
@@ -372,7 +404,8 @@ class DuoKongLineIndicator(Indicator):
                         "time": int(row.time),
                         "position": "belowBar",
                         "color": "#ff4d4f",
-                        "shape": "arrowUp",
+                        "shape": "circle",
+                        "size": 1,
                         "text": "多",
                     }
                     for row in df.loc[df["buy_signal"], ["time"]].itertuples(index=False)
@@ -384,7 +417,8 @@ class DuoKongLineIndicator(Indicator):
                         "time": int(row.time),
                         "position": "aboveBar",
                         "color": "#00a86b",
-                        "shape": "arrowDown",
+                        "shape": "circle",
+                        "size": 1,
                         "text": "空",
                     }
                     for row in df.loc[df["sell_signal"], ["time"]].itertuples(index=False)
@@ -393,32 +427,19 @@ class DuoKongLineIndicator(Indicator):
 
         series = [
             SeriesDefinition(
-                id="duo_kong_line_up",
-                name=f"多空线上升({length})",
+                id="duo_kong_line",
+                name=f"多空线({length})",
                 pane="price",
                 series_type="line",
-                data=_trend_line_data(df, "hull", "trend_up", True),
+                data=_colored_line_data(df, "hull", "trend_up", "#e53935", "#00c853"),
                 options={
-                    "color": "#ff4d4f",
+                    "color": "#e53935",
                     "lineWidth": line_width,
                     "priceLineVisible": False,
                     "lastValueVisible": False,
                     "markers": markers,
                 },
-            ),
-            SeriesDefinition(
-                id="duo_kong_line_down",
-                name=f"多空线下降({length})",
-                pane="price",
-                series_type="line",
-                data=_trend_line_data(df, "hull", "trend_up", False),
-                options={
-                    "color": "#00a86b",
-                    "lineWidth": line_width,
-                    "priceLineVisible": False,
-                    "lastValueVisible": False,
-                },
-            ),
+            )
         ]
 
         return IndicatorResult(

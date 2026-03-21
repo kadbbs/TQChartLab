@@ -12,6 +12,12 @@ from .transforms import build_range_bars, build_renko_bars, build_tick_bars, bui
 
 DEFAULT_STORAGE_PROVIDER = "tq"
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "duckdb" / "ticks.duckdb"
+NATIVE_BAR_TABLES = {
+    60: "market_bars_1m",
+    300: "market_bars_5m",
+    600: "market_bars_10m",
+    900: "market_bars_15m",
+}
 
 
 class DuckDBDataSource(DataSource):
@@ -84,6 +90,11 @@ class DuckDBDataSource(DataSource):
         self._cached_signature = signature
         return normalized.copy()
 
+    def _preferred_time_source(self) -> str:
+        if self._has_native_time_bars():
+            return f"native_{self.duration_seconds}s"
+        return "ticks"
+
     def _load_ticks(self) -> pd.DataFrame:
         if self.conn is None:
             raise RuntimeError("DuckDB 连接未初始化。")
@@ -120,6 +131,9 @@ class DuckDBDataSource(DataSource):
     def _load_time_bars(self) -> pd.DataFrame:
         if self.conn is None:
             raise RuntimeError("DuckDB 连接未初始化。")
+
+        if self._has_native_time_bars():
+            return self._load_native_time_bars()
 
         frame = self.conn.execute(
             """
@@ -165,6 +179,66 @@ class DuckDBDataSource(DataSource):
         frame["datetime"] = pd.to_datetime(frame["datetime"])
         return frame
 
+    def _native_bar_table_name(self) -> str | None:
+        return NATIVE_BAR_TABLES.get(self.duration_seconds)
+
+    def _has_native_time_bars(self) -> bool:
+        if self.conn is None:
+            raise RuntimeError("DuckDB 连接未初始化。")
+        table_name = self._native_bar_table_name()
+        if table_name is None:
+            return False
+        row = self.conn.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name = ?
+            LIMIT 1
+            """,
+            [table_name],
+        ).fetchone()
+        if row is None:
+            return False
+
+        count_row = self.conn.execute(
+            f"""
+            SELECT count(*)
+            FROM {table_name}
+            WHERE provider = ? AND symbol = ? AND duration_seconds = ?
+            """,
+            [self.source_provider, self.symbol, self.duration_seconds],
+        ).fetchone()
+        return bool(count_row and int(count_row[0] or 0) > 0)
+
+    def _load_native_time_bars(self) -> pd.DataFrame:
+        if self.conn is None:
+            raise RuntimeError("DuckDB 连接未初始化。")
+        table_name = self._native_bar_table_name()
+        if table_name is None:
+            return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+        frame = self.conn.execute(
+            f"""
+            SELECT
+                bar_start AS datetime,
+                open,
+                high,
+                low,
+                close,
+                volume
+            FROM {table_name}
+            WHERE provider = ? AND symbol = ? AND duration_seconds = ?
+            ORDER BY bar_start DESC
+            LIMIT ?
+            """,
+            [self.source_provider, self.symbol, self.duration_seconds, self.data_length],
+        ).fetchdf()
+        if frame.empty:
+            return frame
+        frame = frame.sort_values("datetime").reset_index(drop=True)
+        frame["datetime"] = pd.to_datetime(frame["datetime"])
+        return frame
+
     def _get_price_tick(self) -> float:
         if self.conn is None:
             raise RuntimeError("DuckDB 连接未初始化。")
@@ -197,4 +271,5 @@ class DuckDBDataSource(DataSource):
             self.bar_mode,
             self.range_ticks,
             self.source_provider,
+            self._preferred_time_source() if self.bar_mode == "time" else "",
         )
