@@ -439,17 +439,33 @@ function renderProviderMeta(payload) {
   els.providerHint.textContent = payload.provider_hint || "当前数据源暂无额外说明。";
 
   const detail = payload.contract_detail || {};
+  const localCount =
+    Number(detail.tick_count || 0) +
+    Number(detail.bar_1m_count || 0) +
+    Number(detail.bar_5m_count || 0) +
+    Number(detail.bar_10m_count || 0) +
+    Number(detail.bar_15m_count || 0);
   const hasLocalCoverage =
     provider === "duckdb" &&
-    (detail.first_tick_at || detail.last_tick_at || Number(detail.tick_count || 0) > 0);
+    (detail.first_data_at || detail.last_data_at || localCount > 0);
 
   els.contractDetailCard.hidden = !hasLocalCoverage;
-  els.detailFirstTick.textContent = formatDetailValue(detail.first_tick_at);
-  els.detailLastTick.textContent = formatDetailValue(detail.last_tick_at);
-  els.detailTickCount.textContent = formatNumberValue(detail.tick_count);
+  els.detailFirstTick.textContent = formatDetailValue(detail.first_data_at || detail.first_tick_at);
+  els.detailLastTick.textContent = formatDetailValue(detail.last_data_at || detail.last_tick_at);
+  els.detailTickCount.textContent = formatNumberValue(localCount);
   els.detailPriceTick.textContent = formatNumberValue(detail.price_tick, 4);
   els.detailContractMonth.textContent = formatDetailValue(detail.contract_month);
   els.detailVolumeMultiple.textContent = formatNumberValue(detail.volume_multiple, 0);
+}
+
+function hasDuckdbLocalData(contract) {
+  return (
+    Number(contract?.tick_count || 0) > 0 ||
+    Number(contract?.bar_1m_count || 0) > 0 ||
+    Number(contract?.bar_5m_count || 0) > 0 ||
+    Number(contract?.bar_10m_count || 0) > 0 ||
+    Number(contract?.bar_15m_count || 0) > 0
+  );
 }
 
 function buildDurationOptions(options, activeValue) {
@@ -494,10 +510,9 @@ function buildContractOptions(contracts, activeSymbol) {
   normalizedContracts.forEach((contract) => {
     const option = document.createElement("option");
     option.value = contract.symbol;
-    const tickCount = Number(contract.tick_count || 0);
-    const hasLocalTicks = provider !== "duckdb" || tickCount > 0;
-    option.textContent = hasLocalTicks ? contract.label : `${contract.label}（无本地数据）`;
-    option.disabled = !hasLocalTicks;
+    const hasLocalData = provider !== "duckdb" || hasDuckdbLocalData(contract);
+    option.textContent = hasLocalData ? contract.label : `${contract.label}（无本地数据）`;
+    option.disabled = !hasLocalData;
     option.selected = contract.symbol === activeSymbol;
     els.symbolSelect.append(option);
   });

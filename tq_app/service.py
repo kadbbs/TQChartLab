@@ -25,6 +25,13 @@ DEFAULT_RANGE_TICKS = 10
 DEFAULT_BRICK_LENGTH = 10000
 
 
+def _contract_has_local_data(contract: dict[str, Any] | None) -> bool:
+    if not contract:
+        return False
+    fields = ("tick_count", "bar_1m_count", "bar_5m_count", "bar_10m_count", "bar_15m_count")
+    return any(int(contract.get(field, 0) or 0) > 0 for field in fields)
+
+
 class MarketDataService:
     def __init__(
         self,
@@ -69,7 +76,7 @@ class MarketDataService:
         selected_symbol = default_symbol
         current_contract = next((item for item in contracts if item["symbol"] == self.symbol), None)
         if current_contract is not None:
-            if effective_provider != "duckdb" or int(current_contract.get("tick_count", 0) or 0) > 0:
+            if effective_provider != "duckdb" or _contract_has_local_data(current_contract):
                 selected_symbol = self.symbol
         indicator_meta = [asdict(meta) for meta in self.indicators.list_meta()]
         return {
@@ -237,9 +244,9 @@ class MarketDataService:
     def _default_symbol_for_provider(self, provider: str) -> str:
         contracts = self._load_contracts(provider)
         if provider == "duckdb":
-            first_with_ticks = next((item for item in contracts if int(item.get("tick_count", 0) or 0) > 0), None)
-            if first_with_ticks:
-                return str(first_with_ticks["symbol"])
+            first_with_data = next((item for item in contracts if _contract_has_local_data(item)), None)
+            if first_with_data:
+                return str(first_with_data["symbol"])
         if contracts:
             return str(contracts[0]["symbol"])
         return self.symbol

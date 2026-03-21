@@ -62,6 +62,36 @@ def load_duckdb_contract_catalog(project_root: Path) -> list[dict[str, Any]]:
     try:
         rows = conn.execute(
             """
+            WITH tick_stats AS (
+                SELECT
+                    provider,
+                    symbol,
+                    min(ts) AS first_tick_at,
+                    max(ts) AS last_tick_at,
+                    count(*) AS tick_count
+                FROM market_ticks
+                GROUP BY provider, symbol
+            ),
+            bar_1m_stats AS (
+                SELECT provider, symbol, min(bar_start) AS first_bar_1m_at, max(bar_start) AS last_bar_1m_at, count(*) AS bar_1m_count
+                FROM market_bars_1m
+                GROUP BY provider, symbol
+            ),
+            bar_5m_stats AS (
+                SELECT provider, symbol, min(bar_start) AS first_bar_5m_at, max(bar_start) AS last_bar_5m_at, count(*) AS bar_5m_count
+                FROM market_bars_5m
+                GROUP BY provider, symbol
+            ),
+            bar_10m_stats AS (
+                SELECT provider, symbol, min(bar_start) AS first_bar_10m_at, max(bar_start) AS last_bar_10m_at, count(*) AS bar_10m_count
+                FROM market_bars_10m
+                GROUP BY provider, symbol
+            ),
+            bar_15m_stats AS (
+                SELECT provider, symbol, min(bar_start) AS first_bar_15m_at, max(bar_start) AS last_bar_15m_at, count(*) AS bar_15m_count
+                FROM market_bars_15m
+                GROUP BY provider, symbol
+            )
             SELECT
                 meta.symbol,
                 meta.instrument_name AS name,
@@ -73,25 +103,44 @@ def load_duckdb_contract_catalog(project_root: Path) -> list[dict[str, Any]]:
                 meta.delivery_year,
                 meta.delivery_month,
                 meta.contract_month,
-                max(ticks.ts) AS last_tick_at,
-                min(ticks.ts) AS first_tick_at,
-                count(ticks.ts) AS tick_count
+                tick_stats.last_tick_at,
+                tick_stats.first_tick_at,
+                coalesce(tick_stats.tick_count, 0) AS tick_count,
+                coalesce(bar_1m_stats.bar_1m_count, 0) AS bar_1m_count,
+                coalesce(bar_5m_stats.bar_5m_count, 0) AS bar_5m_count,
+                coalesce(bar_10m_stats.bar_10m_count, 0) AS bar_10m_count,
+                coalesce(bar_15m_stats.bar_15m_count, 0) AS bar_15m_count,
+                least(
+                    coalesce(tick_stats.first_tick_at, TIMESTAMP '9999-12-31 00:00:00'),
+                    coalesce(bar_1m_stats.first_bar_1m_at, TIMESTAMP '9999-12-31 00:00:00'),
+                    coalesce(bar_5m_stats.first_bar_5m_at, TIMESTAMP '9999-12-31 00:00:00'),
+                    coalesce(bar_10m_stats.first_bar_10m_at, TIMESTAMP '9999-12-31 00:00:00'),
+                    coalesce(bar_15m_stats.first_bar_15m_at, TIMESTAMP '9999-12-31 00:00:00')
+                ) AS first_data_at,
+                greatest(
+                    coalesce(tick_stats.last_tick_at, TIMESTAMP '0001-01-01 00:00:00'),
+                    coalesce(bar_1m_stats.last_bar_1m_at, TIMESTAMP '0001-01-01 00:00:00'),
+                    coalesce(bar_5m_stats.last_bar_5m_at, TIMESTAMP '0001-01-01 00:00:00'),
+                    coalesce(bar_10m_stats.last_bar_10m_at, TIMESTAMP '0001-01-01 00:00:00'),
+                    coalesce(bar_15m_stats.last_bar_15m_at, TIMESTAMP '0001-01-01 00:00:00')
+                ) AS last_data_at
             FROM contract_metadata AS meta
-            LEFT JOIN market_ticks AS ticks
-                ON ticks.provider = meta.provider
-               AND ticks.symbol = meta.symbol
+            LEFT JOIN tick_stats
+                ON tick_stats.provider = meta.provider
+               AND tick_stats.symbol = meta.symbol
+            LEFT JOIN bar_1m_stats
+                ON bar_1m_stats.provider = meta.provider
+               AND bar_1m_stats.symbol = meta.symbol
+            LEFT JOIN bar_5m_stats
+                ON bar_5m_stats.provider = meta.provider
+               AND bar_5m_stats.symbol = meta.symbol
+            LEFT JOIN bar_10m_stats
+                ON bar_10m_stats.provider = meta.provider
+               AND bar_10m_stats.symbol = meta.symbol
+            LEFT JOIN bar_15m_stats
+                ON bar_15m_stats.provider = meta.provider
+               AND bar_15m_stats.symbol = meta.symbol
             WHERE meta.provider = ?
-            GROUP BY
-                meta.symbol,
-                meta.instrument_name,
-                meta.label,
-                meta.exchange_id,
-                meta.product_id,
-                meta.price_tick,
-                meta.volume_multiple,
-                meta.delivery_year,
-                meta.delivery_month,
-                meta.contract_month
             ORDER BY meta.exchange_id, meta.product_id, meta.delivery_year, meta.delivery_month, meta.symbol
             """,
             [storage_provider],
@@ -111,6 +160,12 @@ def load_duckdb_contract_catalog(project_root: Path) -> list[dict[str, Any]]:
                 "last_tick_at": str(row[10]) if row[10] is not None else "",
                 "first_tick_at": str(row[11]) if row[11] is not None else "",
                 "tick_count": int(row[12] or 0),
+                "bar_1m_count": int(row[13] or 0),
+                "bar_5m_count": int(row[14] or 0),
+                "bar_10m_count": int(row[15] or 0),
+                "bar_15m_count": int(row[16] or 0),
+                "first_data_at": "" if row[17] is None or str(row[17]).startswith("9999-12-31") else str(row[17]),
+                "last_data_at": "" if row[18] is None or str(row[18]).startswith("0001-01-01") else str(row[18]),
             }
             for row in rows
         ]

@@ -203,7 +203,7 @@ class DuckDBTickStore:
             return
 
         columns = {
-            str(row[0])
+            str(row[1])
             for row in self.conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
         }
         if required_columns.issubset(columns):
@@ -228,9 +228,11 @@ class DuckDBTickStore:
     def get_latest_timestamp(self, provider: str, symbol: str) -> pd.Timestamp | None:
         row = self.conn.execute(
             f"""
-            SELECT max(ts) AS latest_ts
+            SELECT ts
             FROM {self.table_name}
             WHERE provider = ? AND symbol = ?
+            ORDER BY ts DESC
+            LIMIT 1
             """,
             [provider, symbol],
         ).fetchone()
@@ -268,9 +270,11 @@ class DuckDBTickStore:
         table_name = self.get_bar_table_name(duration_seconds)
         row = self.conn.execute(
             f"""
-            SELECT max(bar_start) AS latest_ts
+            SELECT bar_start
             FROM {table_name}
             WHERE provider = ? AND symbol = ? AND duration_seconds = ?
+            ORDER BY bar_start DESC
+            LIMIT 1
             """,
             [provider, symbol, duration_seconds],
         ).fetchone()
