@@ -27,8 +27,11 @@ const MIN_VISIBLE_DATA_BARS = 60;
 const RANGE_RIGHT_PADDING_BARS = 8;
 const PRICE_RANGE_TOP_PADDING = 0.1;
 const PRICE_RANGE_BOTTOM_PADDING = 0.14;
+const PRICE_RANGE_BOTTOM_PADDING_WITH_VOLUME_PANE = 0.02;
+const RIGHT_PRICE_SCALE_MIN_WIDTH = 72;
 const RENKO_DEFAULT_TICKS = 5;
 const RANGE_DEFAULT_TICKS = 10;
+const VOLUME_PANE_ID = "__volume__";
 
 function formatAxisTimeLabel(time) {
   if (typeof time === "number") {
@@ -257,6 +260,7 @@ const chartTheme = {
   rightPriceScale: {
     borderColor: "rgba(92, 70, 47, 0.18)",
     autoScale: true,
+    minimumWidth: RIGHT_PRICE_SCALE_MIN_WIDTH,
     scaleMargins: {
       top: 0.16,
       bottom: 0.2,
@@ -673,6 +677,9 @@ function toggleParamInputs(indicatorId, enabled) {
 
 function paneLayoutFor(indicators) {
   const panes = ["price"];
+  if (indicators.some((item) => item.pane === "indicator")) {
+    panes.push(VOLUME_PANE_ID);
+  }
   indicators.forEach((item) => {
     if (item.pane === "indicator") {
       panes.push(item.id);
@@ -884,11 +891,64 @@ function focusComputedBars(chart, snapshot) {
   });
 }
 
-function chartHeight(index, total) {
-  if (index === 0) {
-    return total === 1 ? 100 : 68;
+function paneHeights(panes) {
+  const total = panes.length;
+  const hasVolumePane = panes.includes(VOLUME_PANE_ID);
+
+  if (!hasVolumePane) {
+    if (total <= 1) {
+      return [100];
+    }
+    if (total === 2) {
+      return [80, 20];
+    }
+    if (total === 3) {
+      return [72, 14, 14];
+    }
+    if (total === 4) {
+      return [64, 12, 12, 12];
+    }
+
+    const pricePaneHeight = 58;
+    const secondaryPaneHeight = (100 - pricePaneHeight) / (total - 1);
+    return [pricePaneHeight, ...Array.from({ length: total - 1 }, () => secondaryPaneHeight)];
   }
-  return Math.max(18, Math.floor(32 / (total - 1)));
+
+  const indicatorCount = total - 2;
+  if (indicatorCount <= 0) {
+    return [82, 18];
+  }
+  if (indicatorCount === 1) {
+    return [46, 14, 40];
+  }
+  if (indicatorCount === 2) {
+    return [44, 12, 22, 22];
+  }
+  if (indicatorCount === 3) {
+    return [42, 10, 16, 16, 16];
+  }
+
+  const pricePaneHeight = 46;
+  const volumePaneHeight = 10;
+  const secondaryPaneHeight = (100 - pricePaneHeight - volumePaneHeight) / indicatorCount;
+  return [
+    pricePaneHeight,
+    volumePaneHeight,
+    ...Array.from({ length: indicatorCount }, () => secondaryPaneHeight),
+  ];
+}
+
+function volumeOverlayScaleMargins(totalPanes) {
+  if (totalPanes <= 1) {
+    return { top: 0.82, bottom: 0.02 };
+  }
+  if (totalPanes === 2) {
+    return { top: 0.8, bottom: 0.02 };
+  }
+  if (totalPanes === 3) {
+    return { top: 0.82, bottom: 0.02 };
+  }
+  return { top: 0.84, bottom: 0.02 };
 }
 
 function rebuildCharts() {
@@ -905,11 +965,15 @@ function rebuildCharts() {
 
   const activeIndicators = state.config.indicators.filter((item) => state.selectedIndicators.includes(item.id));
   const panes = paneLayoutFor(activeIndicators);
+  const heights = paneHeights(panes);
+  els.chartStack.style.gap = panes.length <= 1 ? "8px" : panes.length === 2 ? "5px" : "3px";
 
   panes.forEach((paneId, index) => {
     const pane = document.createElement("div");
     pane.className = "chart-pane";
-    pane.style.height = `${chartHeight(index, panes.length)}%`;
+    pane.style.flexBasis = `${heights[index]}%`;
+    pane.style.height = `${heights[index]}%`;
+    pane.style.minHeight = paneId === "price" ? "220px" : paneId === VOLUME_PANE_ID ? "88px" : "96px";
     els.chartStack.appendChild(pane);
 
     const chart = LightweightCharts.createChart(pane, {
@@ -930,6 +994,8 @@ function rebuildCharts() {
   }
 
   const priceChart = state.charts[0].chart;
+  const volumePaneEntry = state.charts.find((entry) => entry.paneId === VOLUME_PANE_ID);
+  const volumeChart = volumePaneEntry?.chart || priceChart;
   const candleSeries = priceChart.addCandlestickSeries({
     upColor: "#197278",
     downColor: "#c44536",
@@ -946,37 +1012,58 @@ function rebuildCharts() {
       const minValue = autoscaleInfo.priceRange.minValue;
       const maxValue = autoscaleInfo.priceRange.maxValue;
       const range = Math.max(maxValue - minValue, Math.abs(maxValue) * 0.01, 1e-6);
+      const bottomPadding = volumePaneEntry
+        ? PRICE_RANGE_BOTTOM_PADDING_WITH_VOLUME_PANE
+        : PRICE_RANGE_BOTTOM_PADDING;
       return {
         ...autoscaleInfo,
         priceRange: {
-          minValue: minValue - range * PRICE_RANGE_BOTTOM_PADDING,
+          minValue: minValue - range * bottomPadding,
           maxValue: maxValue + range * PRICE_RANGE_TOP_PADDING,
         },
       };
     },
   });
-  const volumeSeries = priceChart.addHistogramSeries({
-    priceScaleId: "",
-    priceFormat: { type: "volume" },
-  });
-  priceChart.priceScale("").applyOptions({
-    scaleMargins: { top: 0.78, bottom: 0 },
-  });
-  priceChart.timeScale().applyOptions({
-    visible: state.charts.length === 1,
-  });
-  state.charts.slice(1).forEach((entry, index) => {
-    entry.chart.timeScale().applyOptions({
-      visible: index === state.charts.length - 2,
+  let volumeSeries;
+  if (volumePaneEntry) {
+    volumeSeries = volumeChart.addHistogramSeries({
+      priceFormat: { type: "volume" },
     });
-    entry.chart.priceScale("right").applyOptions({
+    volumeChart.priceScale("right").applyOptions({
       autoScale: true,
-      scaleMargins: { top: 0.18, bottom: 0.18 },
+      minimumWidth: RIGHT_PRICE_SCALE_MIN_WIDTH,
+      scaleMargins: { top: 0.08, bottom: 0.12 },
     });
+  } else {
+    volumeSeries = priceChart.addHistogramSeries({
+      priceScaleId: "",
+      priceFormat: { type: "volume" },
+    });
+    priceChart.priceScale("").applyOptions({
+      scaleMargins: volumeOverlayScaleMargins(panes.length),
+    });
+  }
+
+  state.charts.forEach((entry, index) => {
+    const isLastPane = index === state.charts.length - 1;
+    const isVolumePane = entry.paneId === VOLUME_PANE_ID;
+    entry.chart.timeScale().applyOptions({
+      visible: isLastPane,
+    });
+
+    if (entry.paneId !== "price" && !isVolumePane) {
+      entry.chart.priceScale("right").applyOptions({
+        autoScale: true,
+        minimumWidth: RIGHT_PRICE_SCALE_MIN_WIDTH,
+        scaleMargins: { top: 0.18, bottom: 0.18 },
+      });
+    }
   });
 
   state.seriesByKey.set("candles", candleSeries);
   state.seriesByKey.set("volume", volumeSeries);
+  state.seriesChartByKey.set("candles", priceChart);
+  state.seriesChartByKey.set("volume", volumeChart);
 }
 
 function createSeries(chart, definition) {

@@ -279,7 +279,7 @@ body {
 }
 
 .canvas-card {
-  height: calc(100vh - 44px);
+  height: calc(100vh - 32px);
   padding: 18px;
   border: 1px solid rgba(92, 70, 47, 0.14);
   border-radius: 28px;
@@ -288,14 +288,17 @@ body {
 }
 
 .chart-stack {
-  display: grid;
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   height: 100%;
+  min-height: 0;
 }
 
 .chart-pane {
   width: 100%;
-  min-height: 120px;
+  min-height: 96px;
+  flex: 0 0 auto;
   border-radius: 18px;
   overflow: hidden;
   background: rgba(255, 252, 247, 0.96);
