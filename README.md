@@ -147,9 +147,7 @@ http://127.0.0.1:8050
 
 - Linux `amd64`
 - Linux `arm64`
-- Windows `amd64`
 - Windows `x86`
-- macOS `amd64`
 - macOS `arm64`
 
 打包方式：

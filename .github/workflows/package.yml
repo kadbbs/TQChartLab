@@ -27,21 +27,11 @@ jobs:
             python-version: "3.12"
             python-architecture: arm64
             archive-name: tq-chart-workbench-linux-arm64
-          - label: windows-amd64
-            runner: windows-latest
-            python-version: "3.12"
-            python-architecture: x64
-            archive-name: tq-chart-workbench-windows-amd64
           - label: windows-x86
             runner: windows-latest
             python-version: "3.12"
             python-architecture: x86
             archive-name: tq-chart-workbench-windows-x86
-          - label: macos-amd64
-            runner: macos-13
-            python-version: "3.12"
-            python-architecture: x64
-            archive-name: tq-chart-workbench-macos-amd64
           - label: macos-arm64
             runner: macos-14
             python-version: "3.12"
