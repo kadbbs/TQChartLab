@@ -153,9 +153,9 @@ http://127.0.0.1:8050
 
 打包方式：
 
-- 使用 `PyInstaller` 生成独立运行目录
-- 自动打进 `templates/`、`static/`
-- 自动包含 `custom_indicators.py`、`.env.example`、`README.md`、`LICENSE`
+- 使用 `PyInstaller` 生成单文件可执行程序（`onefile`）
+- 运行时资源会打进可执行程序内部
+- Release 额外附带 `.env.example`、`README.md`、`LICENSE`
 
 产物命名示例：
 
@@ -173,7 +173,8 @@ pyinstaller --clean tq_chart_workbench.spec
 
 打包输出目录：
 
-- `dist/tq-chart-workbench/`
+- Unix: `dist/tq-chart-workbench`
+- Windows: `dist/tq-chart-workbench.exe`
 
 ## 前端能力
 

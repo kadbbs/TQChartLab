@@ -64,23 +64,29 @@ jobs:
       - name: 整理说明文件
         shell: bash
         run: |
-          cp .env.example dist/tq-chart-workbench/.env.example
-          cp README.md dist/tq-chart-workbench/README.md
-          cp LICENSE dist/tq-chart-workbench/LICENSE
+          mkdir -p package
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "dist/tq-chart-workbench.exe" "package/tq-chart-workbench.exe"
+          else
+            cp "dist/tq-chart-workbench" "package/tq-chart-workbench"
+          fi
+          cp .env.example package/.env.example
+          cp README.md package/README.md
+          cp LICENSE package/LICENSE
 
       - name: 生成压缩包 (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p release
-          tar -C dist -czf "release/${{ matrix.archive-name }}.tar.gz" tq-chart-workbench
+          tar -C package -czf "release/${{ matrix.archive-name }}.tar.gz" .
 
       - name: 生成压缩包 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path dist/tq-chart-workbench -DestinationPath "release/${{ matrix.archive-name }}.zip" -Force
+          Compress-Archive -Path package/* -DestinationPath "release/${{ matrix.archive-name }}.zip" -Force
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
