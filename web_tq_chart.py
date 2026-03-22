@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+import sys
 import webbrowser
 from pathlib import Path
 
@@ -20,6 +21,14 @@ DEFAULT_PORT = 8050
 DEFAULT_BAR_MODE = "time"
 DEFAULT_RANGE_TICKS = 10
 DEFAULT_BRICK_LENGTH = 10000
+
+
+def runtime_project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+    return Path(__file__).resolve().parent
 
 
 class ServerThread(threading.Thread):
@@ -64,7 +73,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    project_root = Path(__file__).resolve().parent
+    project_root = runtime_project_root()
     service = MarketDataService(
         provider=args.provider,
         symbol=args.symbol,

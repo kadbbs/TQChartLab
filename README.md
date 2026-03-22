@@ -135,6 +135,46 @@ http://127.0.0.1:8050
 - `--host`：监听地址
 - `--port`：监听端口
 
+## GitHub Actions 打包
+
+仓库内置了跨平台打包工作流：
+
+- 工作流文件：[.github/workflows/package.yml](.github/workflows/package.yml)
+- `workflow_dispatch` 可手动触发
+- 推送 `v*` 标签时会自动打包，并上传到 GitHub Release
+
+当前默认覆盖这些构建目标：
+
+- Linux `amd64`
+- Linux `arm64`
+- Windows `amd64`
+- Windows `x86`
+- macOS `amd64`
+- macOS `arm64`
+
+打包方式：
+
+- 使用 `PyInstaller` 生成独立运行目录
+- 自动打进 `templates/`、`static/`
+- 自动包含 `custom_indicators.py`、`.env.example`、`README.md`、`LICENSE`
+
+产物命名示例：
+
+- `tq-chart-workbench-linux-amd64.tar.gz`
+- `tq-chart-workbench-windows-x86.zip`
+- `tq-chart-workbench-macos-arm64.tar.gz`
+
+如果你本地也想先试打一次：
+
+```bash
+pip install pyinstaller
+pyinstaller --clean tq_chart_workbench.spec
+```
+
+打包输出目录：
+
+- `dist/tq-chart-workbench/`
+
 ## 前端能力
 
 左侧控制区支持：

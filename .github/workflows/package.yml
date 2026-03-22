@@ -1,0 +1,111 @@
+name: package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-amd64
+            runner: ubuntu-24.04
+            python-version: "3.12"
+            python-architecture: x64
+            archive-name: tq-chart-workbench-linux-amd64
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            python-version: "3.12"
+            python-architecture: arm64
+            archive-name: tq-chart-workbench-linux-arm64
+          - label: windows-amd64
+            runner: windows-latest
+            python-version: "3.12"
+            python-architecture: x64
+            archive-name: tq-chart-workbench-windows-amd64
+          - label: windows-x86
+            runner: windows-latest
+            python-version: "3.12"
+            python-architecture: x86
+            archive-name: tq-chart-workbench-windows-x86
+          - label: macos-amd64
+            runner: macos-13
+            python-version: "3.12"
+            python-architecture: x64
+            archive-name: tq-chart-workbench-macos-amd64
+          - label: macos-arm64
+            runner: macos-14
+            python-version: "3.12"
+            python-architecture: arm64
+            archive-name: tq-chart-workbench-macos-arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.python-architecture }}
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 打包应用
+        run: pyinstaller --clean tq_chart_workbench.spec
+
+      - name: 整理说明文件
+        shell: bash
+        run: |
+          cp .env.example dist/tq-chart-workbench/.env.example
+          cp README.md dist/tq-chart-workbench/README.md
+          cp LICENSE dist/tq-chart-workbench/LICENSE
+
+      - name: 生成压缩包 (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release
+          tar -C dist -czf "release/${{ matrix.archive-name }}.tar.gz" tq-chart-workbench
+
+      - name: 生成压缩包 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path dist/tq-chart-workbench -DestinationPath "release/${{ matrix.archive-name }}.zip" -Force
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive-name }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: 上传到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*
