@@ -10,10 +10,13 @@ LOCAL_TZ = "Asia/Shanghai"
 def _to_local_datetime(series: pd.Series) -> pd.Series:
     if pd.api.types.is_numeric_dtype(series):
         utc_times = pd.to_datetime(series, unit="ns", utc=True)
-    else:
-        parsed = pd.to_datetime(series, utc=True)
-        utc_times = parsed
-    return utc_times.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+        return utc_times.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+
+    parsed = pd.to_datetime(series)
+    tz = getattr(parsed.dt, "tz", None)
+    if tz is None:
+        return parsed
+    return parsed.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
 
 
 def normalize_bars(klines: pd.DataFrame) -> pd.DataFrame:
@@ -156,13 +159,17 @@ def build_renko_bars(ticks: pd.DataFrame, price_tick: float, range_ticks: int, b
     last_close = float(ticks.iloc[0]["last_price"])
     prev_total_volume: float | None = None
     pending_volume = 0.0
+    pending_start_time = pd.Timestamp(ticks.iloc[0]["datetime"])
 
     for row in ticks.itertuples(index=False):
         price = float(row.last_price)
+        timestamp = pd.Timestamp(row.datetime)
         total_volume = float(getattr(row, "volume", 0) or 0)
         volume_delta = max(total_volume - prev_total_volume, 0) if prev_total_volume is not None else 0.0
         prev_total_volume = total_volume
         pending_volume += volume_delta
+        if pending_start_time is None:
+            pending_start_time = timestamp
 
         diff = price - last_close
         brick_count = int(abs(diff) // brick_size)
@@ -171,12 +178,12 @@ def build_renko_bars(ticks: pd.DataFrame, price_tick: float, range_ticks: int, b
 
         direction = 1 if diff > 0 else -1
         volume_per_brick = pending_volume / brick_count if brick_count else 0.0
-        for _ in range(brick_count):
+        for brick_index in range(brick_count):
             open_price = last_close
             close_price = open_price + direction * brick_size
             rows.append(
                 {
-                    "datetime": pd.Timestamp(row.datetime),
+                    "datetime": pending_start_time if brick_index == 0 else timestamp,
                     "open": open_price,
                     "high": max(open_price, close_price),
                     "low": min(open_price, close_price),
@@ -186,6 +193,7 @@ def build_renko_bars(ticks: pd.DataFrame, price_tick: float, range_ticks: int, b
             )
             last_close = close_price
         pending_volume = 0.0
+        pending_start_time = timestamp
 
     if not rows:
         return pd.DataFrame(columns=EMPTY_BAR_COLUMNS)

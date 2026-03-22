@@ -98,10 +98,10 @@ function resolveDisplayTime(time) {
     }
   }
 
-  if (state.activeBarMode === "time" && state.timeLabels.size > 0) {
+  if (state.timeLabels.size > 0) {
     let nearestLabel = null;
     let nearestDiff = Number.POSITIVE_INFINITY;
-    const maxDiff = Math.max((state.activeDurationSeconds || 60) * 2, 120);
+    const maxDiff = 2;
     for (const [key, label] of state.timeLabels.entries()) {
       const numericKey = Number(key);
       if (!Number.isFinite(numericKey) || !label) {

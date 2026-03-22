@@ -290,18 +290,11 @@ class MarketDataService:
     def _with_chart_time(bars: pd.DataFrame, bar_mode: str) -> pd.DataFrame:
         normalized = bars.copy()
         base_times = (normalized["datetime"].astype("int64") // 10**9).tolist()
-        if bar_mode in {"tick", "range", "renko"} and base_times:
+        if base_times:
             start_time = int(base_times[0])
             adjusted_times = [start_time + index for index in range(len(base_times))]
         else:
             adjusted_times = []
-            previous_time: int | None = None
-            for base_time in base_times:
-                chart_time = int(base_time)
-                if previous_time is not None and chart_time <= previous_time:
-                    chart_time = previous_time + 1
-                adjusted_times.append(chart_time)
-                previous_time = chart_time
         normalized["time"] = adjusted_times
         normalized["display_time"] = normalized["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         return normalized
