@@ -98,6 +98,26 @@ function resolveDisplayTime(time) {
     }
   }
 
+  if (state.activeBarMode === "time" && state.timeLabels.size > 0) {
+    let nearestLabel = null;
+    let nearestDiff = Number.POSITIVE_INFINITY;
+    const maxDiff = Math.max((state.activeDurationSeconds || 60) * 2, 120);
+    for (const [key, label] of state.timeLabels.entries()) {
+      const numericKey = Number(key);
+      if (!Number.isFinite(numericKey) || !label) {
+        continue;
+      }
+      const diff = Math.abs(numericKey - time);
+      if (diff < nearestDiff) {
+        nearestDiff = diff;
+        nearestLabel = label;
+      }
+    }
+    if (nearestLabel && nearestDiff <= maxDiff) {
+      return nearestLabel;
+    }
+  }
+
   return null;
 }
 
@@ -297,7 +317,7 @@ const chartTheme = {
     horzLines: { color: "rgba(92, 70, 47, 0.09)" },
   },
   crosshair: {
-    mode: LightweightCharts.CrosshairMode.Normal,
+    mode: LightweightCharts.CrosshairMode.Magnet,
     vertLine: { color: "#a24f2f", labelBackgroundColor: "#a24f2f" },
     horzLine: { color: "#a24f2f", labelBackgroundColor: "#a24f2f" },
   },
@@ -338,6 +358,26 @@ const chartTheme = {
   localization: {
     locale: "zh-CN",
     dateFormat: "yyyy-MM-dd",
+    timeFormatter: (time) => {
+      const resolved = resolveDisplayTime(time);
+      if (resolved) {
+        return resolved;
+      }
+      if (state.activeBarMode === "time") {
+        return "";
+      }
+      if (typeof time === "number") {
+        return new Date(time * 1000).toLocaleString("zh-CN", {
+          hour12: false,
+        });
+      }
+      if (time && typeof time === "object" && "year" in time) {
+        const month = String(time.month).padStart(2, "0");
+        const day = String(time.day).padStart(2, "0");
+        return `${time.year}-${month}-${day}`;
+      }
+      return "";
+    },
   },
 };
 
@@ -1189,6 +1229,9 @@ function formatCrosshairTime(time) {
   if (resolved) {
     return resolved;
   }
+  if (state.activeBarMode === "time") {
+    return "--";
+  }
   if (typeof time === "number") {
     if (Math.abs(time) < 1e9) {
       return new Date(time * 1000 * 1000).toLocaleString("zh-CN", {
@@ -1251,7 +1294,8 @@ function applySnapshot(snapshot) {
   els.lastUpdate.textContent = snapshot.last_time;
 
   const sanitizedSnapshot = sanitizePricePaneIndicators(snapshot);
-  const displaySnapshot = trimSnapshotForDisplay(sanitizedSnapshot);
+  const trimmedSnapshot = trimSnapshotForDisplay(sanitizedSnapshot);
+  const displaySnapshot = trimmedSnapshot;
   state.timeLabels = new Map(Object.entries(displaySnapshot.time_labels || {}));
   const previousCandleCount = (state.seriesDataByKey.get("candles") || []).length;
   const candleSeries = state.seriesByKey.get("candles");

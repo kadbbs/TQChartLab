@@ -4,11 +4,21 @@ import pandas as pd
 
 
 EMPTY_BAR_COLUMNS = ["datetime", "open", "high", "low", "close", "volume"]
+LOCAL_TZ = "Asia/Shanghai"
+
+
+def _to_local_datetime(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        utc_times = pd.to_datetime(series, unit="ns", utc=True)
+    else:
+        parsed = pd.to_datetime(series, utc=True)
+        utc_times = parsed
+    return utc_times.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
 
 
 def normalize_bars(klines: pd.DataFrame) -> pd.DataFrame:
     bars = klines.copy()
-    bars["datetime"] = pd.to_datetime(bars["datetime"], unit="ns")
+    bars["datetime"] = _to_local_datetime(bars["datetime"])
     bars = bars.dropna(subset=["open", "high", "low", "close"])
     if bars.empty:
         return pd.DataFrame(columns=EMPTY_BAR_COLUMNS)
@@ -20,10 +30,7 @@ def normalize_ticks(ticks: pd.DataFrame) -> pd.DataFrame:
     normalized = ticks.copy()
     if normalized.empty:
         return pd.DataFrame(columns=["datetime", "last_price", "volume"])
-    if pd.api.types.is_numeric_dtype(normalized["datetime"]):
-        normalized["datetime"] = pd.to_datetime(normalized["datetime"], unit="ns")
-    else:
-        normalized["datetime"] = pd.to_datetime(normalized["datetime"])
+    normalized["datetime"] = _to_local_datetime(normalized["datetime"])
     normalized = normalized.dropna(subset=["last_price"])
     if normalized.empty:
         return pd.DataFrame(columns=["datetime", "last_price", "volume"])
