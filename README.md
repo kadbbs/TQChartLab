@@ -147,7 +147,7 @@ http://127.0.0.1:8050
 
 - Linux `amd64`
 - Linux `arm64`
-- Windows `x86`
+- Windows `amd64`
 - macOS `arm64`
 
 打包方式：
@@ -159,7 +159,7 @@ http://127.0.0.1:8050
 产物命名示例：
 
 - `tq-chart-workbench-linux-amd64.tar.gz`
-- `tq-chart-workbench-windows-x86.zip`
+- `tq-chart-workbench-windows-amd64.zip`
 - `tq-chart-workbench-macos-arm64.tar.gz`
 
 如果你本地也想先试打一次：
