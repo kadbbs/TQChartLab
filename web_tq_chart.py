@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import socket
 import threading
 import sys
 import webbrowser
 from pathlib import Path
 
-from werkzeug.serving import make_server
+from werkzeug.serving import BaseWSGIServer, make_server
 
 from tq_app.service import MarketDataService
 from tq_app.web import create_app
@@ -43,6 +44,71 @@ class ServerThread(threading.Thread):
 
     def shutdown(self) -> None:
         self.server.shutdown()
+
+
+class IPv6OnlyWSGIServer(BaseWSGIServer):
+    def server_bind(self) -> None:
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
+
+
+class MultiServerThread(threading.Thread):
+    def __init__(self, app, host: str, port: int) -> None:
+        super().__init__(daemon=True)
+        self.context = app.app_context()
+        self.context.push()
+        self.servers: list[BaseWSGIServer] = self._build_servers(app, host, port)
+
+    def _build_servers(self, app, host: str, port: int) -> list[BaseWSGIServer]:
+        normalized_host = host.strip()
+        if normalized_host not in {"0.0.0.0", "::", ""}:
+            return [make_server(normalized_host, port, app)]
+
+        servers: list[BaseWSGIServer] = []
+        ipv4_server = make_server("0.0.0.0", port, app)
+        servers.append(ipv4_server)
+
+        try:
+            ipv6_server = IPv6OnlyWSGIServer("::", port, app)
+        except OSError:
+            ipv6_server = None
+        if ipv6_server is not None:
+            servers.append(ipv6_server)
+
+        return servers
+
+    def run(self) -> None:
+        workers: list[threading.Thread] = []
+        for server in self.servers:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            workers.append(worker)
+        for worker in workers:
+            worker.join()
+
+    def shutdown(self) -> None:
+        for server in self.servers:
+            server.shutdown()
+
+
+def display_url(host: str, port: int) -> str:
+    normalized_host = host.strip()
+    if normalized_host in {"0.0.0.0", "", "::"}:
+        return f"http://127.0.0.1:{port}"
+    if ":" in normalized_host:
+        return f"http://[{normalized_host}]:{port}"
+    return f"http://{normalized_host}:{port}"
+
+
+def listening_summary(host: str, port: int) -> list[str]:
+    normalized_host = host.strip()
+    if normalized_host in {"0.0.0.0", "", "::"}:
+        return [f"http://127.0.0.1:{port}", f"http://[::1]:{port}"]
+    return [display_url(normalized_host, port)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,11 +154,13 @@ def main() -> None:
     service.start()
 
     app = create_app(service, project_root)
-    server = ServerThread(app, args.host, args.port)
-    url = f"http://{args.host}:{args.port}"
+    server = MultiServerThread(app, args.host, args.port)
+    url = display_url(args.host, args.port)
 
     print(f"数据源: {args.provider}")
-    print(f"图表地址: {url}")
+    print("图表地址:")
+    for item in listening_summary(args.host, args.port):
+        print(f"  {item}")
     server.start()
 
     if args.open_browser:
