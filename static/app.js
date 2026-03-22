@@ -20,6 +20,9 @@ const state = {
   refreshTimerId: null,
   snapshotRequestId: 0,
   configRequestId: 0,
+  requestedDataLength: null,
+  historyExpandInFlight: false,
+  pendingHistoryRange: null,
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
@@ -32,15 +35,18 @@ const RIGHT_PRICE_SCALE_MIN_WIDTH = 72;
 const RENKO_DEFAULT_TICKS = 5;
 const RANGE_DEFAULT_TICKS = 10;
 const VOLUME_PANE_ID = "__volume__";
+const HISTORY_EXPAND_LEFT_THRESHOLD = 20;
+const MAX_DUCKDB_DATA_LENGTH = 50000;
+const MAX_DUCKDB_BRICK_LENGTH = 100000;
 
 function formatAxisTimeLabel(time) {
+  const resolved = resolveDisplayTime(time);
+  if (resolved) {
+    const [datePart, timePart = ""] = resolved.split(" ");
+    const [, month = "", day = ""] = datePart.split("-");
+    return timePart ? `${month}-${day} ${timePart.slice(0, 5)}` : `${month}-${day}`;
+  }
   if (typeof time === "number") {
-    const exact = state.timeLabels.get(String(time));
-    if (exact) {
-      const [datePart, timePart = ""] = exact.split(" ");
-      const [, month = "", day = ""] = datePart.split("-");
-      return timePart ? `${month}-${day} ${timePart.slice(0, 5)}` : `${month}-${day}`;
-    }
     return new Date(time * 1000).toLocaleString("zh-CN", {
       hour12: false,
       month: "2-digit",
@@ -55,6 +61,44 @@ function formatAxisTimeLabel(time) {
     return `${month}-${day}`;
   }
   return "";
+}
+
+function resolveDisplayTime(time) {
+  if (typeof time !== "number") {
+    return null;
+  }
+
+  const candidates = [
+    String(time),
+    String(Math.round(time)),
+    String(Math.floor(time)),
+    String(Math.ceil(time)),
+  ];
+
+  if (Math.abs(time) < 1e9) {
+    candidates.push(
+      String(Math.round(time * 1000)),
+      String(Math.floor(time * 1000)),
+      String(Math.ceil(time * 1000))
+    );
+  }
+
+  if (Math.abs(time) > 1e11) {
+    candidates.push(
+      String(Math.round(time / 1000)),
+      String(Math.floor(time / 1000)),
+      String(Math.ceil(time / 1000))
+    );
+  }
+
+  for (const candidate of candidates) {
+    const label = state.timeLabels.get(candidate);
+    if (label) {
+      return label;
+    }
+  }
+
+  return null;
 }
 
 class LineBandPrimitiveRenderer {
@@ -779,6 +823,9 @@ function primarySeriesKeyForPane(paneId) {
   if (paneId === "price") {
     return "candles";
   }
+  if (paneId === VOLUME_PANE_ID) {
+    return "volume";
+  }
   return state.primarySeriesKeyByPane.get(paneId) || null;
 }
 
@@ -951,6 +998,54 @@ function volumeOverlayScaleMargins(totalPanes) {
   return { top: 0.84, bottom: 0.02 };
 }
 
+function currentRequestedDataLength() {
+  return state.requestedDataLength || state.config?.data_length || 800;
+}
+
+function maybeExpandDuckdbHistory(range) {
+  if (state.activeProvider !== "duckdb" || state.historyExpandInFlight) {
+    return;
+  }
+  if (!range || !Number.isFinite(range.from) || range.from > HISTORY_EXPAND_LEFT_THRESHOLD) {
+    return;
+  }
+
+  let expanded = false;
+  if (state.activeBarMode === "time") {
+    const currentLength = currentRequestedDataLength();
+    const nextLength = Math.min(
+      MAX_DUCKDB_DATA_LENGTH,
+      Math.max(currentLength + 500, Math.round(currentLength * 1.8))
+    );
+    if (nextLength > currentLength) {
+      state.requestedDataLength = nextLength;
+      expanded = true;
+    }
+  } else {
+    const currentLength = getRequestedBrickLength();
+    const nextLength = Math.min(
+      MAX_DUCKDB_BRICK_LENGTH,
+      Math.max(currentLength + 1000, Math.round(currentLength * 1.8))
+    );
+    if (nextLength > currentLength) {
+      els.brickLengthInput.value = String(nextLength);
+      expanded = true;
+    }
+  }
+
+  if (!expanded) {
+    return;
+  }
+
+  state.pendingHistoryRange = { from: range.from, to: range.to };
+  state.historyExpandInFlight = true;
+  refreshSnapshot().catch((error) => {
+    els.error.textContent = error.message;
+    state.historyExpandInFlight = false;
+    state.pendingHistoryRange = null;
+  });
+}
+
 function rebuildCharts() {
   state.charts.forEach((entry) => entry.chart.remove());
   state.charts = [];
@@ -986,6 +1081,11 @@ function rebuildCharts() {
     chart.subscribeCrosshairMove((param) => {
       syncCrosshair(paneId, param);
     });
+    if (paneId === "price") {
+      chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        maybeExpandDuckdbHistory(range);
+      });
+    }
   });
 
   for (let i = 0; i < state.charts.length - 1; i += 1) {
@@ -1085,13 +1185,16 @@ function indicatorPaneId(indicator) {
 }
 
 function formatCrosshairTime(time) {
-  if (typeof time === "number") {
-    const exact = state.timeLabels.get(String(time));
-    if (exact) {
-      return exact;
-    }
+  const resolved = resolveDisplayTime(time);
+  if (resolved) {
+    return resolved;
   }
   if (typeof time === "number") {
+    if (Math.abs(time) < 1e9) {
+      return new Date(time * 1000 * 1000).toLocaleString("zh-CN", {
+        hour12: false,
+      });
+    }
     return new Date(time * 1000).toLocaleString("zh-CN", {
       hour12: false,
     });
@@ -1150,6 +1253,7 @@ function applySnapshot(snapshot) {
   const sanitizedSnapshot = sanitizePricePaneIndicators(snapshot);
   const displaySnapshot = trimSnapshotForDisplay(sanitizedSnapshot);
   state.timeLabels = new Map(Object.entries(displaySnapshot.time_labels || {}));
+  const previousCandleCount = (state.seriesDataByKey.get("candles") || []).length;
   const candleSeries = state.seriesByKey.get("candles");
   const volumeSeries = state.seriesByKey.get("volume");
   setSeriesData("candles", candleSeries, displaySnapshot.candles);
@@ -1235,6 +1339,19 @@ function applySnapshot(snapshot) {
     }
     state.hasFitted = true;
   }
+
+  if (state.pendingHistoryRange && state.charts.length > 0) {
+    const addedBars = Math.max(displaySnapshot.candles.length - previousCandleCount, 0);
+    const priceChart = state.charts[0].chart;
+    if (addedBars > 0) {
+      priceChart.timeScale().setVisibleLogicalRange({
+        from: state.pendingHistoryRange.from + addedBars,
+        to: state.pendingHistoryRange.to + addedBars,
+      });
+    }
+    state.pendingHistoryRange = null;
+    state.historyExpandInFlight = false;
+  }
 }
 
 async function refreshSnapshot() {
@@ -1246,6 +1363,7 @@ async function refreshSnapshot() {
   params.set("bar_mode", getRequestedBarMode());
   params.set("range_ticks", String(getRequestedRangeTicks()));
   params.set("brick_length", String(getRequestedBrickLength()));
+  params.set("data_length", String(currentRequestedDataLength()));
   if (state.selectedIndicators.length) {
     params.set("indicators", state.selectedIndicators.join(","));
     const selectedParams = {};
@@ -1278,6 +1396,7 @@ async function refreshConfig(provider) {
   state.activeProvider = nextConfig.provider;
   state.activeSymbol = nextConfig.symbol;
   state.activeBrickLength = nextConfig.brick_length || state.activeBrickLength || 10000;
+  state.requestedDataLength = nextConfig.data_length || state.requestedDataLength || 800;
   buildProviderOptions(nextConfig.providers || [], nextConfig.provider);
   buildContractOptions(nextConfig.contracts || [], nextConfig.symbol);
   buildBarModeOptions(nextConfig.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
@@ -1327,6 +1446,7 @@ async function boot() {
   state.activeBarMode = state.config.bar_mode || "time";
   state.activeRangeTicks = state.config.range_ticks || 10;
   state.activeBrickLength = state.config.brick_length || 10000;
+  state.requestedDataLength = state.config.data_length || 800;
   state.timeLabels = new Map();
   state.selectedIndicators = [...state.config.default_indicator_ids];
   state.indicatorParams = getDefaultIndicatorParams(state.config.indicators);

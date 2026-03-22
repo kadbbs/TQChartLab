@@ -55,12 +55,20 @@ class MarketDataService:
         self.bar_mode = bar_mode
         self.range_ticks = range_ticks
         self._source_lock = threading.Lock()
-        self._data_sources: dict[tuple[str, str, int, str, int, int], DataSource] = {}
+        self._data_sources: dict[tuple[str, str, int, str, int, int, int], DataSource] = {}
         self._contracts_by_provider: dict[str, list[dict[str, Any]]] = {}
         self.indicators = build_indicator_registry(project_root)
 
     def start(self) -> None:
-        self._get_data_source(self.provider, self.symbol, self.duration_seconds, self.bar_mode, self.range_ticks, self.brick_length)
+        self._get_data_source(
+            self.provider,
+            self.symbol,
+            self.duration_seconds,
+            self.bar_mode,
+            self.range_ticks,
+            self.brick_length,
+            self.data_length,
+        )
 
     def stop(self) -> None:
         with self._source_lock:
@@ -108,6 +116,7 @@ class MarketDataService:
         bar_mode: str | None = None,
         range_ticks: int | None = None,
         brick_length: int | None = None,
+        data_length: int | None = None,
         provider: str | None = None,
     ) -> dict[str, Any]:
         effective_provider = self._resolve_provider(provider)
@@ -116,6 +125,7 @@ class MarketDataService:
         effective_bar_mode = (bar_mode or self.bar_mode).strip() or "time"
         effective_range_ticks = range_ticks or self.range_ticks
         effective_brick_length = brick_length or self.brick_length
+        effective_data_length = data_length or self.data_length
         bars = self._get_data_source(
             effective_provider,
             effective_symbol,
@@ -123,6 +133,7 @@ class MarketDataService:
             effective_bar_mode,
             effective_range_ticks,
             effective_brick_length,
+            effective_data_length,
         ).get_bars()
         normalized = self._with_chart_time(bars, effective_bar_mode)
         selected = indicator_ids or self.indicators.default_ids()
@@ -148,6 +159,7 @@ class MarketDataService:
             "bar_mode": effective_bar_mode,
             "range_ticks": effective_range_ticks,
             "brick_length": effective_brick_length,
+            "data_length": effective_data_length,
             "time_labels": self._serialize_time_labels(normalized),
             "candles": self._serialize_candles(normalized),
             "volume": self._serialize_volume(normalized),
@@ -204,6 +216,7 @@ class MarketDataService:
         bar_mode: str,
         range_ticks: int,
         brick_length: int,
+        data_length: int,
     ) -> DataSource:
         if not symbol:
             raise ValueError("合约不能为空。")
@@ -215,8 +228,10 @@ class MarketDataService:
             raise ValueError("Range Tick 必须大于 0。")
         if brick_length <= 0:
             raise ValueError("Brick Length 必须大于 0。")
+        if data_length <= 0:
+            raise ValueError("Data Length 必须大于 0。")
 
-        key = (provider, symbol, duration_seconds, bar_mode, range_ticks, brick_length)
+        key = (provider, symbol, duration_seconds, bar_mode, range_ticks, brick_length, data_length)
         with self._source_lock:
             data_source = self._data_sources.get(key)
             if data_source is None:
@@ -224,7 +239,7 @@ class MarketDataService:
                     provider=provider,
                     symbol=symbol,
                     duration_seconds=duration_seconds,
-                    data_length=self.data_length,
+                    data_length=data_length,
                     brick_length=brick_length,
                     refresh_ms=self.refresh_ms,
                     bar_mode=bar_mode,
