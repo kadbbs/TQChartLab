@@ -19,6 +19,7 @@ MIN_TICK_SERIAL_LENGTH = 120000
 MAX_TICK_SERIAL_LENGTH = 500000
 PSEUDO_ORDERFLOW_MAX_BARS = 240
 APPROX_TICKS_PER_5M_BAR = 800
+PSEUDO_ORDERFLOW_TICK_LENGTH = 50000
 
 
 class TqDataSource(DataSource):
@@ -42,6 +43,7 @@ class TqDataSource(DataSource):
         self.bar_mode = bar_mode
         self.range_ticks = range_ticks
         self.enable_pseudo_orderflow = False
+        self._orderflow_enabled_at: pd.Timestamp | None = None
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop_event = threading.Event()
@@ -72,7 +74,12 @@ class TqDataSource(DataSource):
     def configure(self, **kwargs) -> None:
         enabled = kwargs.get("enable_pseudo_orderflow")
         if enabled is not None:
-            self.enable_pseudo_orderflow = bool(enabled)
+            enabled = bool(enabled)
+            if enabled and not self.enable_pseudo_orderflow:
+                self._orderflow_enabled_at = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+            if not enabled:
+                self._orderflow_enabled_at = None
+            self.enable_pseudo_orderflow = enabled
 
     def _run(self) -> None:
         api = None
@@ -86,6 +93,7 @@ class TqDataSource(DataSource):
             api = TqApi(auth=TqAuth(user, password))
             quote = api.get_quote(self.symbol)
             tick_serial = None
+            orderflow_tick_serial = None
             if self.bar_mode in {"tick", "range", "renko"}:
                 tick_length = self._tick_data_length()
                 tick_serial = api.get_tick_serial(self.symbol, data_length=tick_length)
@@ -95,13 +103,11 @@ class TqDataSource(DataSource):
                     duration_seconds=self.duration_seconds,
                     data_length=self.data_length,
                 )
-                if self._pseudo_orderflow_enabled():
-                    tick_serial = api.get_tick_serial(self.symbol, data_length=self._tick_data_length())
 
             while not self._stop_event.is_set():
                 api.wait_update(deadline=time.time() + self.refresh_ms / 1000)
-                if self._pseudo_orderflow_enabled() and tick_serial is None:
-                    tick_serial = api.get_tick_serial(self.symbol, data_length=self._tick_data_length())
+                if self._pseudo_orderflow_enabled() and orderflow_tick_serial is None:
+                    orderflow_tick_serial = api.get_tick_serial(self.symbol, data_length=PSEUDO_ORDERFLOW_TICK_LENGTH)
                 if self.bar_mode in {"tick", "range", "renko"}:
                     price_tick = float(getattr(quote, "price_tick", 0) or 0)
                     if self.bar_mode in {"range", "renko"} and price_tick <= 0:
@@ -115,12 +121,15 @@ class TqDataSource(DataSource):
                         bars = build_renko_bars(ticks, price_tick, self.range_ticks, self.brick_length)
                 else:
                     bars = normalize_bars(klines)
-                    if self._pseudo_orderflow_enabled() and tick_serial is not None and not bars.empty:
+                    if self._pseudo_orderflow_enabled() and orderflow_tick_serial is not None and not bars.empty:
                         orderflow_bars = bars.tail(min(len(bars), PSEUDO_ORDERFLOW_MAX_BARS)).copy()
-                        ticks = self._limit_ticks_to_recent_days(normalize_ticks(tick_serial))
+                        ticks = normalize_ticks(orderflow_tick_serial)
+                        start_dt = pd.Timestamp(orderflow_bars.iloc[0]["datetime"])
+                        if self._orderflow_enabled_at is not None:
+                            start_dt = max(start_dt, self._orderflow_enabled_at.floor("5min"))
                         ticks = self._filter_ticks_for_bars(
                             ticks,
-                            pd.Timestamp(orderflow_bars.iloc[0]["datetime"]),
+                            start_dt,
                             pd.Timestamp(orderflow_bars.iloc[-1]["datetime"]) + pd.Timedelta(seconds=self.duration_seconds),
                         )
                         if not ticks.empty:

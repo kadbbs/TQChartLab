@@ -62,7 +62,6 @@ def _classify_tick_direction(frame: pd.DataFrame) -> pd.Series:
     ask = pd.to_numeric(frame.get("ask_price1"), errors="coerce")
     mid = (bid + ask) / 2.0
     prev_price = price.shift(1)
-    prev_sign = pd.Series(np.nan, index=frame.index, dtype="float64")
 
     direction = pd.Series(np.nan, index=frame.index, dtype="float64")
     direction = np.where(price > prev_price, 1.0, direction)
@@ -77,12 +76,7 @@ def _classify_tick_direction(frame: pd.DataFrame) -> pd.Series:
     direction = pd.Series(direction, index=frame.index, dtype="float64")
     direction = direction.where(~direction.isna(), np.where(price < mid, -1.0, np.nan))
     direction = pd.Series(direction, index=frame.index, dtype="float64")
-
-    prev_sign.iloc[0] = 0.0
-    for idx in range(1, len(direction)):
-        prev_sign.iloc[idx] = direction.iloc[idx - 1] if not pd.isna(direction.iloc[idx - 1]) else prev_sign.iloc[idx - 1]
-
-    return direction.fillna(prev_sign).fillna(0.0)
+    return direction.ffill().fillna(0.0)
 
 
 def build_5m_pseudo_orderflow(ticks: pd.DataFrame) -> pd.DataFrame:

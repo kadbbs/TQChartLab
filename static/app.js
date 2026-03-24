@@ -732,8 +732,14 @@ function buildIndicatorSelector(indicators, defaults) {
     checkbox.addEventListener("change", async () => {
       state.selectedIndicators = getIndicatorIds();
       toggleParamInputs(indicator.id, checkbox.checked);
-      rebuildCharts();
-      await refreshSnapshot();
+      try {
+        const snapshot = await fetchSnapshotPayload();
+        rebuildCharts();
+        applySnapshot(snapshot);
+        syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+      } catch (error) {
+        els.error.textContent = error.message;
+      }
     });
 
     const content = document.createElement("div");
@@ -1427,6 +1433,15 @@ function applySnapshot(snapshot) {
 
 async function refreshSnapshot() {
   const requestId = ++state.snapshotRequestId;
+  const snapshot = await fetchSnapshotPayload();
+  if (requestId !== state.snapshotRequestId) {
+    return;
+  }
+  applySnapshot(snapshot);
+  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+}
+
+async function fetchSnapshotPayload() {
   const params = new URLSearchParams();
   params.set("provider", getRequestedProvider());
   params.set("symbol", getRequestedSymbol());
@@ -1444,12 +1459,7 @@ async function refreshSnapshot() {
     params.set("indicator_params", JSON.stringify(selectedParams));
   }
   const query = params.toString();
-  const snapshot = await fetchJson(`/api/snapshot${query ? `?${query}` : ""}`);
-  if (requestId !== state.snapshotRequestId) {
-    return;
-  }
-  applySnapshot(snapshot);
-  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+  return fetchJson(`/api/snapshot${query ? `?${query}` : ""}`);
 }
 
 async function refreshConfig(provider) {
