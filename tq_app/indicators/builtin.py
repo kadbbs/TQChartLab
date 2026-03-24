@@ -166,7 +166,68 @@ class SmaIndicator(Indicator):
         )
 
 
+class PseudoOrderflow5mIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="pseudo_orderflow_5m",
+        name="5分钟仿订单流",
+        pane="indicator",
+        description="基于 5 分钟 bar 内部特征的仿订单流状态图，主要展示 5 个二值条件。",
+        enabled_by_default=False,
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict[str, Any] | None = None) -> IndicatorResult:
+        df = bars.copy()
+        flag_specs = [
+            ("delta_positive_flag_5m", "Delta>0", 5.0),
+            ("delta_ratio_above_mean20_flag_5m", "DeltaRatio>均值20", 4.0),
+            ("doi_positive_flag_5m", "dOI>0", 3.0),
+            ("imbalance_positive_flag_5m", "盘口尾值>0", 2.0),
+            ("efficiency_above_median20_flag_5m", "Efficiency>中位20", 1.0),
+        ]
+
+        for column, _, _ in flag_specs:
+            if column not in df.columns:
+                df[column] = pd.NA
+
+        def build_flag_points(column: str, level: float) -> list[dict[str, Any]]:
+            times = df["time"].astype(int).tolist()
+            values = pd.to_numeric(df[column], errors="coerce")
+            valid_mask = values.notna().tolist()
+            active_mask = values.fillna(0.0).gt(0.5).tolist()
+            points: list[dict[str, Any]] = []
+            for time_value, is_valid, is_active in zip(times, valid_mask, active_mask):
+                if not is_valid:
+                    points.append({"time": time_value})
+                    continue
+                points.append(
+                    {
+                        "time": time_value,
+                        "value": level + 0.32 if is_active else level - 0.32,
+                        "color": TV_UP if is_active else "#b0b0b0",
+                    }
+                )
+            return points
+
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=[
+                SeriesDefinition(
+                    id=f"pseudo_orderflow_5m_{column}",
+                    name=name,
+                    pane="indicator",
+                    series_type="histogram",
+                    data=build_flag_points(column, level),
+                    options={"base": level, "priceLineVisible": False, "lastValueVisible": False},
+                )
+                for column, name, level in flag_specs
+            ],
+        )
+
+
 def register_builtin_indicators(registry: IndicatorRegistry) -> None:
     registry.register(AtrBandsIndicator())
     registry.register(MacdIndicator())
     registry.register(SmaIndicator())
+    registry.register(PseudoOrderflow5mIndicator())

@@ -38,6 +38,21 @@ const VOLUME_PANE_ID = "__volume__";
 const HISTORY_EXPAND_LEFT_THRESHOLD = 20;
 const MAX_DUCKDB_DATA_LENGTH = 50000;
 const MAX_DUCKDB_BRICK_LENGTH = 100000;
+const INCREMENTAL_UPDATE_MAX_NEW_BARS = 3;
+const ORDERFLOW_REFRESH_MS = 450;
+
+function paneLabelConfig(paneId) {
+  if (paneId === "pseudo_orderflow_5m") {
+    return [
+      { text: "Delta>0", top: "12%" },
+      { text: "DeltaRatio>均值20", top: "29%" },
+      { text: "dOI>0", top: "46%" },
+      { text: "盘口尾值>0", top: "63%" },
+      { text: "Efficiency>中位20", top: "80%" },
+    ];
+  }
+  return [];
+}
 
 function formatAxisTimeLabel(time) {
   const resolved = resolveDisplayTime(time);
@@ -719,8 +734,14 @@ function buildIndicatorSelector(indicators, defaults) {
     checkbox.addEventListener("change", async () => {
       state.selectedIndicators = getIndicatorIds();
       toggleParamInputs(indicator.id, checkbox.checked);
-      rebuildCharts();
-      await refreshSnapshot();
+      try {
+        const snapshot = await fetchSnapshotPayload();
+        rebuildCharts();
+        applySnapshot(snapshot);
+        syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+      } catch (error) {
+        els.error.textContent = error.message;
+      }
     });
 
     const content = document.createElement("div");
@@ -804,8 +825,38 @@ function findSeriesPointAtTime(seriesKey, time) {
   return points.find((point) => point && point.time === time) || null;
 }
 
+function canApplyIncrementalSeriesUpdate(previousData, nextData) {
+  if (!Array.isArray(previousData) || !Array.isArray(nextData)) {
+    return false;
+  }
+  if (previousData.length === 0 || nextData.length === 0) {
+    return false;
+  }
+  if (nextData.length < previousData.length) {
+    return false;
+  }
+  if (nextData.length - previousData.length > INCREMENTAL_UPDATE_MAX_NEW_BARS) {
+    return false;
+  }
+  const stablePrefix = previousData.length - 1;
+  for (let index = 0; index < stablePrefix; index += 1) {
+    if (String(previousData[index]?.time) !== String(nextData[index]?.time)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function setSeriesData(seriesKey, series, data) {
-  series.setData(data);
+  const previousData = state.seriesDataByKey.get(seriesKey);
+  if (typeof series?.update === "function" && canApplyIncrementalSeriesUpdate(previousData, data)) {
+    const startIndex = Math.max(0, previousData.length - 1);
+    data.slice(startIndex).forEach((point) => {
+      series.update(point);
+    });
+  } else {
+    series.setData(data);
+  }
   state.seriesDataByKey.set(seriesKey, data);
 }
 
@@ -1111,6 +1162,20 @@ function rebuildCharts() {
     pane.style.minHeight = paneId === "price" ? "220px" : paneId === VOLUME_PANE_ID ? "88px" : "96px";
     els.chartStack.appendChild(pane);
 
+    const paneLabels = paneLabelConfig(paneId);
+    if (paneLabels.length > 0) {
+      const overlay = document.createElement("div");
+      overlay.className = "pane-label-overlay";
+      paneLabels.forEach((item) => {
+        const label = document.createElement("div");
+        label.className = "pane-label-tag";
+        label.textContent = item.text;
+        label.style.top = item.top;
+        overlay.appendChild(label);
+      });
+      pane.appendChild(overlay);
+    }
+
     const chart = LightweightCharts.createChart(pane, {
       width: pane.clientWidth || 800,
       height: pane.clientHeight || 300,
@@ -1400,6 +1465,15 @@ function applySnapshot(snapshot) {
 
 async function refreshSnapshot() {
   const requestId = ++state.snapshotRequestId;
+  const snapshot = await fetchSnapshotPayload();
+  if (requestId !== state.snapshotRequestId) {
+    return;
+  }
+  applySnapshot(snapshot);
+  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+}
+
+async function fetchSnapshotPayload() {
   const params = new URLSearchParams();
   params.set("provider", getRequestedProvider());
   params.set("symbol", getRequestedSymbol());
@@ -1417,12 +1491,7 @@ async function refreshSnapshot() {
     params.set("indicator_params", JSON.stringify(selectedParams));
   }
   const query = params.toString();
-  const snapshot = await fetchJson(`/api/snapshot${query ? `?${query}` : ""}`);
-  if (requestId !== state.snapshotRequestId) {
-    return;
-  }
-  applySnapshot(snapshot);
-  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+  return fetchJson(`/api/snapshot${query ? `?${query}` : ""}`);
 }
 
 async function refreshConfig(provider) {
@@ -1461,7 +1530,16 @@ function syncAutoRefresh(refreshMs) {
     window.clearInterval(state.refreshTimerId);
     state.refreshTimerId = null;
   }
-  if (!Number.isFinite(refreshMs) || refreshMs <= 0) {
+  let effectiveRefreshMs = refreshMs;
+  if (
+    state.activeProvider === "tq" &&
+    state.activeBarMode === "time" &&
+    getRequestedDuration() === 300 &&
+    state.selectedIndicators.includes("pseudo_orderflow_5m")
+  ) {
+    effectiveRefreshMs = Math.max(refreshMs || 0, ORDERFLOW_REFRESH_MS);
+  }
+  if (!Number.isFinite(effectiveRefreshMs) || effectiveRefreshMs <= 0) {
     return;
   }
   state.refreshTimerId = window.setInterval(async () => {
@@ -1470,7 +1548,7 @@ function syncAutoRefresh(refreshMs) {
     } catch (error) {
       els.error.textContent = error.message;
     }
-  }, refreshMs);
+  }, effectiveRefreshMs);
 }
 
 function resizeCharts() {
