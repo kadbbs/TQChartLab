@@ -38,6 +38,8 @@ const VOLUME_PANE_ID = "__volume__";
 const HISTORY_EXPAND_LEFT_THRESHOLD = 20;
 const MAX_DUCKDB_DATA_LENGTH = 50000;
 const MAX_DUCKDB_BRICK_LENGTH = 100000;
+const INCREMENTAL_UPDATE_MAX_NEW_BARS = 3;
+const ORDERFLOW_REFRESH_MS = 450;
 
 function paneLabelConfig(paneId) {
   if (paneId === "pseudo_orderflow_5m") {
@@ -823,8 +825,38 @@ function findSeriesPointAtTime(seriesKey, time) {
   return points.find((point) => point && point.time === time) || null;
 }
 
+function canApplyIncrementalSeriesUpdate(previousData, nextData) {
+  if (!Array.isArray(previousData) || !Array.isArray(nextData)) {
+    return false;
+  }
+  if (previousData.length === 0 || nextData.length === 0) {
+    return false;
+  }
+  if (nextData.length < previousData.length) {
+    return false;
+  }
+  if (nextData.length - previousData.length > INCREMENTAL_UPDATE_MAX_NEW_BARS) {
+    return false;
+  }
+  const stablePrefix = previousData.length - 1;
+  for (let index = 0; index < stablePrefix; index += 1) {
+    if (String(previousData[index]?.time) !== String(nextData[index]?.time)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function setSeriesData(seriesKey, series, data) {
-  series.setData(data);
+  const previousData = state.seriesDataByKey.get(seriesKey);
+  if (typeof series?.update === "function" && canApplyIncrementalSeriesUpdate(previousData, data)) {
+    const startIndex = Math.max(0, previousData.length - 1);
+    data.slice(startIndex).forEach((point) => {
+      series.update(point);
+    });
+  } else {
+    series.setData(data);
+  }
   state.seriesDataByKey.set(seriesKey, data);
 }
 
@@ -1498,7 +1530,16 @@ function syncAutoRefresh(refreshMs) {
     window.clearInterval(state.refreshTimerId);
     state.refreshTimerId = null;
   }
-  if (!Number.isFinite(refreshMs) || refreshMs <= 0) {
+  let effectiveRefreshMs = refreshMs;
+  if (
+    state.activeProvider === "tq" &&
+    state.activeBarMode === "time" &&
+    getRequestedDuration() === 300 &&
+    state.selectedIndicators.includes("pseudo_orderflow_5m")
+  ) {
+    effectiveRefreshMs = Math.max(refreshMs || 0, ORDERFLOW_REFRESH_MS);
+  }
+  if (!Number.isFinite(effectiveRefreshMs) || effectiveRefreshMs <= 0) {
     return;
   }
   state.refreshTimerId = window.setInterval(async () => {
@@ -1507,7 +1548,7 @@ function syncAutoRefresh(refreshMs) {
     } catch (error) {
       els.error.textContent = error.message;
     }
-  }, refreshMs);
+  }, effectiveRefreshMs);
 }
 
 function resizeCharts() {
