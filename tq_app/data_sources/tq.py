@@ -8,7 +8,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
-from orderflow import merge_5m_pseudo_orderflow_into_bars
+from orderflow import IncrementalPseudoOrderflow5m, merge_5m_pseudo_orderflow_into_bars
 
 from .base import DataSource
 from .transforms import build_range_bars, build_renko_bars, build_tick_bars, normalize_bars, normalize_ticks
@@ -44,6 +44,8 @@ class TqDataSource(DataSource):
         self.range_ticks = range_ticks
         self.enable_pseudo_orderflow = False
         self._orderflow_enabled_at: pd.Timestamp | None = None
+        self._orderflow_state = IncrementalPseudoOrderflow5m(max_bars=PSEUDO_ORDERFLOW_MAX_BARS)
+        self._orderflow_session_active = False
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop_event = threading.Event()
@@ -77,8 +79,11 @@ class TqDataSource(DataSource):
             enabled = bool(enabled)
             if enabled and not self.enable_pseudo_orderflow:
                 self._orderflow_enabled_at = pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None)
+                self._orderflow_session_active = False
             if not enabled:
                 self._orderflow_enabled_at = None
+                self._orderflow_session_active = False
+                self._orderflow_state.reset()
             self.enable_pseudo_orderflow = enabled
 
     def _run(self) -> None:
@@ -108,6 +113,8 @@ class TqDataSource(DataSource):
                 api.wait_update(deadline=time.time() + self.refresh_ms / 1000)
                 if self._pseudo_orderflow_enabled() and orderflow_tick_serial is None:
                     orderflow_tick_serial = api.get_tick_serial(self.symbol, data_length=PSEUDO_ORDERFLOW_TICK_LENGTH)
+                if (not self._pseudo_orderflow_enabled()) and orderflow_tick_serial is not None:
+                    orderflow_tick_serial = None
                 if self.bar_mode in {"tick", "range", "renko"}:
                     price_tick = float(getattr(quote, "price_tick", 0) or 0)
                     if self.bar_mode in {"range", "renko"} and price_tick <= 0:
@@ -122,25 +129,7 @@ class TqDataSource(DataSource):
                 else:
                     bars = normalize_bars(klines)
                     if self._pseudo_orderflow_enabled() and orderflow_tick_serial is not None and not bars.empty:
-                        orderflow_bars = bars.tail(min(len(bars), PSEUDO_ORDERFLOW_MAX_BARS)).copy()
-                        ticks = normalize_ticks(orderflow_tick_serial)
-                        start_dt = pd.Timestamp(orderflow_bars.iloc[0]["datetime"])
-                        if self._orderflow_enabled_at is not None:
-                            start_dt = max(start_dt, self._orderflow_enabled_at.floor("5min"))
-                        ticks = self._filter_ticks_for_bars(
-                            ticks,
-                            start_dt,
-                            pd.Timestamp(orderflow_bars.iloc[-1]["datetime"]) + pd.Timedelta(seconds=self.duration_seconds),
-                        )
-                        if not ticks.empty:
-                            enriched = merge_5m_pseudo_orderflow_into_bars(orderflow_bars, ticks)
-                            flag_columns = [column for column in enriched.columns if column not in bars.columns]
-                            if flag_columns:
-                                bars = bars.merge(
-                                    enriched[["datetime", *flag_columns]],
-                                    on="datetime",
-                                    how="left",
-                                )
+                        bars = self._merge_incremental_orderflow(bars, orderflow_tick_serial)
                 if not bars.empty:
                     with self._lock:
                         self._bars = bars
@@ -167,6 +156,49 @@ class TqDataSource(DataSource):
 
     def _pseudo_orderflow_enabled(self) -> bool:
         return self.enable_pseudo_orderflow and self.bar_mode == "time" and self.duration_seconds == 300
+
+    def _merge_incremental_orderflow(self, bars: pd.DataFrame, tick_serial: pd.DataFrame) -> pd.DataFrame:
+        orderflow_bars = bars.tail(min(len(bars), PSEUDO_ORDERFLOW_MAX_BARS)).copy()
+        if orderflow_bars.empty:
+            return bars
+
+        raw_ticks = tick_serial.copy()
+        raw_ticks = raw_ticks.dropna(subset=["id", "datetime", "last_price"])
+        raw_ticks["id"] = pd.to_numeric(raw_ticks["id"], errors="coerce")
+        raw_ticks = raw_ticks.dropna(subset=["id"])
+
+        if not self._orderflow_session_active:
+            if raw_ticks.empty:
+                return bars
+            self._orderflow_state.reset()
+            self._orderflow_state.set_last_tick_id(float(raw_ticks["id"].max()))
+            self._orderflow_session_active = True
+            return bars
+
+        last_tick_id = self._orderflow_state.last_tick_id
+        if last_tick_id is not None:
+            raw_ticks = raw_ticks.loc[raw_ticks["id"] > last_tick_id]
+        if raw_ticks.empty:
+            return self._merge_orderflow_frame_into_bars(bars, self._orderflow_state.to_frame())
+
+        ticks = normalize_ticks(raw_ticks)
+        if self._orderflow_enabled_at is not None:
+            ticks = ticks.loc[ticks["datetime"] >= self._orderflow_enabled_at]
+        end_dt = pd.Timestamp(orderflow_bars.iloc[-1]["datetime"]) + pd.Timedelta(seconds=self.duration_seconds)
+        start_dt = pd.Timestamp(orderflow_bars.iloc[0]["datetime"])
+        ticks = self._filter_ticks_for_bars(ticks, start_dt, end_dt)
+        if not ticks.empty:
+            self._orderflow_state.update(ticks)
+        return self._merge_orderflow_frame_into_bars(bars, self._orderflow_state.to_frame())
+
+    @staticmethod
+    def _merge_orderflow_frame_into_bars(bars: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
+        if features.empty:
+            return bars
+        flag_columns = [column for column in features.columns if column not in bars.columns]
+        if not flag_columns:
+            return bars
+        return bars.merge(features[["datetime", *flag_columns]], on="datetime", how="left")
 
     @staticmethod
     def _filter_ticks_for_bars(
