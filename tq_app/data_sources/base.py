@@ -19,3 +19,6 @@ class DataSource(ABC):
     @abstractmethod
     def get_bars(self) -> pd.DataFrame:
         raise NotImplementedError
+
+    def configure(self, **kwargs) -> None:
+        return None

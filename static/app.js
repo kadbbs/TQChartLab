@@ -39,6 +39,19 @@ const HISTORY_EXPAND_LEFT_THRESHOLD = 20;
 const MAX_DUCKDB_DATA_LENGTH = 50000;
 const MAX_DUCKDB_BRICK_LENGTH = 100000;
 
+function paneLabelConfig(paneId) {
+  if (paneId === "pseudo_orderflow_5m") {
+    return [
+      { text: "Delta>0", top: "12%" },
+      { text: "DeltaRatio>均值20", top: "29%" },
+      { text: "dOI>0", top: "46%" },
+      { text: "盘口尾值>0", top: "63%" },
+      { text: "Efficiency>中位20", top: "80%" },
+    ];
+  }
+  return [];
+}
+
 function formatAxisTimeLabel(time) {
   const resolved = resolveDisplayTime(time);
   if (resolved) {
@@ -1110,6 +1123,20 @@ function rebuildCharts() {
     pane.style.height = `${heights[index]}%`;
     pane.style.minHeight = paneId === "price" ? "220px" : paneId === VOLUME_PANE_ID ? "88px" : "96px";
     els.chartStack.appendChild(pane);
+
+    const paneLabels = paneLabelConfig(paneId);
+    if (paneLabels.length > 0) {
+      const overlay = document.createElement("div");
+      overlay.className = "pane-label-overlay";
+      paneLabels.forEach((item) => {
+        const label = document.createElement("div");
+        label.className = "pane-label-tag";
+        label.textContent = item.text;
+        label.style.top = item.top;
+        overlay.appendChild(label);
+      });
+      pane.appendChild(overlay);
+    }
 
     const chart = LightweightCharts.createChart(pane, {
       width: pane.clientWidth || 800,

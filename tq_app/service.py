@@ -126,7 +126,11 @@ class MarketDataService:
         effective_range_ticks = range_ticks or self.range_ticks
         effective_brick_length = brick_length or self.brick_length
         effective_data_length = data_length or self.data_length
-        bars = self._get_data_source(
+        selected = indicator_ids or self.indicators.default_ids()
+        all_params = indicator_params or {}
+        need_pseudo_orderflow = "pseudo_orderflow_5m" in selected
+
+        data_source = self._get_data_source(
             effective_provider,
             effective_symbol,
             effective_duration,
@@ -134,10 +138,10 @@ class MarketDataService:
             effective_range_ticks,
             effective_brick_length,
             effective_data_length,
-        ).get_bars()
+        )
+        data_source.configure(enable_pseudo_orderflow=need_pseudo_orderflow)
+        bars = data_source.get_bars()
         normalized = self._with_chart_time(bars, effective_bar_mode)
-        selected = indicator_ids or self.indicators.default_ids()
-        all_params = indicator_params or {}
 
         results: list[IndicatorResult] = []
         for indicator_id in selected:

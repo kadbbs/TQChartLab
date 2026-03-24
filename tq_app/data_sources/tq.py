@@ -8,6 +8,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqsdk import TqApi, TqAuth
 
+from orderflow import merge_5m_pseudo_orderflow_into_bars
+
 from .base import DataSource
 from .transforms import build_range_bars, build_renko_bars, build_tick_bars, normalize_bars, normalize_ticks
 
@@ -15,6 +17,8 @@ TICK_LOOKBACK_DAYS = 10
 APPROX_TICKS_PER_DAY = 80000
 MIN_TICK_SERIAL_LENGTH = 120000
 MAX_TICK_SERIAL_LENGTH = 500000
+PSEUDO_ORDERFLOW_MAX_BARS = 240
+APPROX_TICKS_PER_5M_BAR = 800
 
 
 class TqDataSource(DataSource):
@@ -37,6 +41,7 @@ class TqDataSource(DataSource):
         self.refresh_ms = refresh_ms
         self.bar_mode = bar_mode
         self.range_ticks = range_ticks
+        self.enable_pseudo_orderflow = False
         self._lock = threading.Lock()
         self._ready = threading.Event()
         self._stop_event = threading.Event()
@@ -64,6 +69,11 @@ class TqDataSource(DataSource):
                 raise RuntimeError("行情数据还没准备好，请稍后刷新页面。")
             return self._bars.copy()
 
+    def configure(self, **kwargs) -> None:
+        enabled = kwargs.get("enable_pseudo_orderflow")
+        if enabled is not None:
+            self.enable_pseudo_orderflow = bool(enabled)
+
     def _run(self) -> None:
         api = None
         try:
@@ -75,6 +85,7 @@ class TqDataSource(DataSource):
 
             api = TqApi(auth=TqAuth(user, password))
             quote = api.get_quote(self.symbol)
+            tick_serial = None
             if self.bar_mode in {"tick", "range", "renko"}:
                 tick_length = self._tick_data_length()
                 tick_serial = api.get_tick_serial(self.symbol, data_length=tick_length)
@@ -84,9 +95,13 @@ class TqDataSource(DataSource):
                     duration_seconds=self.duration_seconds,
                     data_length=self.data_length,
                 )
+                if self._pseudo_orderflow_enabled():
+                    tick_serial = api.get_tick_serial(self.symbol, data_length=self._tick_data_length())
 
             while not self._stop_event.is_set():
                 api.wait_update(deadline=time.time() + self.refresh_ms / 1000)
+                if self._pseudo_orderflow_enabled() and tick_serial is None:
+                    tick_serial = api.get_tick_serial(self.symbol, data_length=self._tick_data_length())
                 if self.bar_mode in {"tick", "range", "renko"}:
                     price_tick = float(getattr(quote, "price_tick", 0) or 0)
                     if self.bar_mode in {"range", "renko"} and price_tick <= 0:
@@ -100,6 +115,23 @@ class TqDataSource(DataSource):
                         bars = build_renko_bars(ticks, price_tick, self.range_ticks, self.brick_length)
                 else:
                     bars = normalize_bars(klines)
+                    if self._pseudo_orderflow_enabled() and tick_serial is not None and not bars.empty:
+                        orderflow_bars = bars.tail(min(len(bars), PSEUDO_ORDERFLOW_MAX_BARS)).copy()
+                        ticks = self._limit_ticks_to_recent_days(normalize_ticks(tick_serial))
+                        ticks = self._filter_ticks_for_bars(
+                            ticks,
+                            pd.Timestamp(orderflow_bars.iloc[0]["datetime"]),
+                            pd.Timestamp(orderflow_bars.iloc[-1]["datetime"]) + pd.Timedelta(seconds=self.duration_seconds),
+                        )
+                        if not ticks.empty:
+                            enriched = merge_5m_pseudo_orderflow_into_bars(orderflow_bars, ticks)
+                            flag_columns = [column for column in enriched.columns if column not in bars.columns]
+                            if flag_columns:
+                                bars = bars.merge(
+                                    enriched[["datetime", *flag_columns]],
+                                    on="datetime",
+                                    how="left",
+                                )
                 if not bars.empty:
                     with self._lock:
                         self._bars = bars
@@ -117,8 +149,28 @@ class TqDataSource(DataSource):
         target_ticks = TICK_LOOKBACK_DAYS * APPROX_TICKS_PER_DAY
         if self.bar_mode == "tick":
             return max(self.data_length, target_ticks, MIN_TICK_SERIAL_LENGTH)
+        if self.bar_mode == "time" and self.duration_seconds == 300:
+            target_bars = min(self.data_length, PSEUDO_ORDERFLOW_MAX_BARS)
+            estimated = target_bars * APPROX_TICKS_PER_5M_BAR
+            return max(40_000, min(estimated, 200_000))
         estimated = self.brick_length * max(self.range_ticks, 4) * 12
         return max(MIN_TICK_SERIAL_LENGTH, min(max(estimated, target_ticks), MAX_TICK_SERIAL_LENGTH))
+
+    def _pseudo_orderflow_enabled(self) -> bool:
+        return self.enable_pseudo_orderflow and self.bar_mode == "time" and self.duration_seconds == 300
+
+    @staticmethod
+    def _filter_ticks_for_bars(
+        ticks: pd.DataFrame,
+        start_dt: pd.Timestamp,
+        end_dt: pd.Timestamp,
+    ) -> pd.DataFrame:
+        if ticks.empty:
+            return ticks
+        filtered = ticks.loc[(ticks["datetime"] >= start_dt) & (ticks["datetime"] < end_dt)]
+        if filtered.empty:
+            return filtered
+        return filtered.reset_index(drop=True)
 
     @staticmethod
     def _limit_ticks_to_recent_days(ticks: pd.DataFrame) -> pd.DataFrame:

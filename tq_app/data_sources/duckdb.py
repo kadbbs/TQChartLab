@@ -7,6 +7,8 @@ from typing import Any
 import duckdb
 import pandas as pd
 
+from orderflow import merge_5m_pseudo_orderflow_into_bars
+
 from .base import DataSource
 from .transforms import build_range_bars, build_renko_bars, build_tick_bars, build_time_bars_from_ticks, normalize_ticks
 
@@ -40,6 +42,7 @@ class DuckDBDataSource(DataSource):
         self.refresh_ms = refresh_ms
         self.bar_mode = bar_mode
         self.range_ticks = range_ticks
+        self.enable_pseudo_orderflow = False
         self.source_provider = os.getenv("DUCKDB_SOURCE_PROVIDER", DEFAULT_STORAGE_PROVIDER).strip() or DEFAULT_STORAGE_PROVIDER
         configured_path = os.getenv("DUCKDB_TICK_DB_PATH", "").strip()
         self.db_path = Path(configured_path).expanduser() if configured_path else DEFAULT_DB_PATH
@@ -90,6 +93,11 @@ class DuckDBDataSource(DataSource):
         self._cached_signature = signature
         return normalized.copy()
 
+    def configure(self, **kwargs) -> None:
+        enabled = kwargs.get("enable_pseudo_orderflow")
+        if enabled is not None:
+            self.enable_pseudo_orderflow = bool(enabled)
+
     def _preferred_time_source(self) -> str:
         if self._has_native_time_bars():
             return f"native_{self.duration_seconds}s"
@@ -133,50 +141,59 @@ class DuckDBDataSource(DataSource):
             raise RuntimeError("DuckDB 连接未初始化。")
 
         if self._has_native_time_bars():
-            return self._load_native_time_bars()
+            frame = self._load_native_time_bars()
+        else:
+            frame = self.conn.execute(
+                """
+                WITH ordered AS (
+                    SELECT
+                        ts,
+                        last_price,
+                        CASE
+                            WHEN volume IS NULL THEN 0
+                            ELSE GREATEST(volume - COALESCE(LAG(volume) OVER (ORDER BY ts), volume), 0)
+                        END AS volume_delta,
+                        FLOOR(epoch(ts) / ?) * ? AS bucket_epoch
+                    FROM market_ticks
+                    WHERE provider = ? AND symbol = ?
+                ),
+                bucketed AS (
+                    SELECT
+                        to_timestamp(bucket_epoch) AS datetime,
+                        arg_min(last_price, ts) AS open,
+                        max(last_price) AS high,
+                        min(last_price) AS low,
+                        arg_max(last_price, ts) AS close,
+                        sum(volume_delta) AS volume
+                    FROM ordered
+                    GROUP BY bucket_epoch
+                )
+                SELECT datetime, open, high, low, close, volume
+                FROM bucketed
+                ORDER BY datetime DESC
+                LIMIT ?
+                """,
+                [
+                    self.duration_seconds,
+                    self.duration_seconds,
+                    self.source_provider,
+                    self.symbol,
+                    self.data_length,
+                ],
+            ).fetchdf()
+            if frame.empty:
+                return frame
+            frame = frame.sort_values("datetime").reset_index(drop=True)
+            frame["datetime"] = pd.to_datetime(frame["datetime"])
 
-        frame = self.conn.execute(
-            """
-            WITH ordered AS (
-                SELECT
-                    ts,
-                    last_price,
-                    CASE
-                        WHEN volume IS NULL THEN 0
-                        ELSE GREATEST(volume - COALESCE(LAG(volume) OVER (ORDER BY ts), volume), 0)
-                    END AS volume_delta,
-                    FLOOR(epoch(ts) / ?) * ? AS bucket_epoch
-                FROM market_ticks
-                WHERE provider = ? AND symbol = ?
-            ),
-            bucketed AS (
-                SELECT
-                    to_timestamp(bucket_epoch) AS datetime,
-                    arg_min(last_price, ts) AS open,
-                    max(last_price) AS high,
-                    min(last_price) AS low,
-                    arg_max(last_price, ts) AS close,
-                    sum(volume_delta) AS volume
-                FROM ordered
-                GROUP BY bucket_epoch
+        if self.enable_pseudo_orderflow and self.duration_seconds == 300:
+            ticks = self._load_ticks_for_time_window(
+                frame.iloc[0]["datetime"],
+                frame.iloc[-1]["datetime"] + pd.Timedelta(seconds=self.duration_seconds),
             )
-            SELECT datetime, open, high, low, close, volume
-            FROM bucketed
-            ORDER BY datetime DESC
-            LIMIT ?
-            """,
-            [
-                self.duration_seconds,
-                self.duration_seconds,
-                self.source_provider,
-                self.symbol,
-                self.data_length,
-            ],
-        ).fetchdf()
-        if frame.empty:
-            return frame
-        frame = frame.sort_values("datetime").reset_index(drop=True)
-        frame["datetime"] = pd.to_datetime(frame["datetime"])
+            if not ticks.empty:
+                frame = merge_5m_pseudo_orderflow_into_bars(frame, ticks)
+
         return frame
 
     def _native_bar_table_name(self) -> str | None:
@@ -253,6 +270,31 @@ class DuckDBDataSource(DataSource):
         if row is None or row[0] is None:
             return 0.0
         return float(row[0])
+
+    def _load_ticks_for_time_window(self, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+        if self.conn is None:
+            raise RuntimeError("DuckDB 连接未初始化。")
+        frame = self.conn.execute(
+            """
+            SELECT
+                ts AS datetime,
+                last_price,
+                volume,
+                open_interest,
+                bid_price1,
+                bid_volume1,
+                ask_price1,
+                ask_volume1
+            FROM market_ticks
+            WHERE provider = ? AND symbol = ? AND ts >= ? AND ts < ?
+            ORDER BY ts
+            """,
+            [self.source_provider, self.symbol, pd.Timestamp(start_dt), pd.Timestamp(end_dt)],
+        ).fetchdf()
+        if frame.empty:
+            return frame
+        frame["datetime"] = pd.to_datetime(frame["datetime"])
+        return frame.reset_index(drop=True)
 
     def _raw_tick_limit(self) -> int:
         if self.bar_mode == "tick":
