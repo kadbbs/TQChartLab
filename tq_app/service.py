@@ -128,7 +128,9 @@ class MarketDataService:
         effective_data_length = data_length or self.data_length
         selected = indicator_ids or self.indicators.default_ids()
         all_params = indicator_params or {}
-        need_pseudo_orderflow = "pseudo_orderflow_5m" in selected
+        need_pseudo_orderflow = any(
+            indicator_id in selected for indicator_id in {"pseudo_orderflow_5m", "spqrc_signals", "spqrc_panel"}
+        )
 
         data_source = self._get_data_source(
             effective_provider,

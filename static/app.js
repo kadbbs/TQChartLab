@@ -44,14 +44,50 @@ const ORDERFLOW_REFRESH_MS = 450;
 function paneLabelConfig(paneId) {
   if (paneId === "pseudo_orderflow_5m") {
     return [
-      { text: "Delta>0", top: "12%" },
-      { text: "DeltaRatio>均值20", top: "29%" },
-      { text: "dOI>0", top: "46%" },
-      { text: "盘口尾值>0", top: "63%" },
-      { text: "Efficiency>中位20", top: "80%" },
+      { text: "Delta>0", value: 5.0 },
+      { text: "DeltaRatio>均值20", value: 4.0 },
+      { text: "dOI>0", value: 3.0 },
+      { text: "盘口尾值>0", value: 2.0 },
+      { text: "Efficiency>中位20", value: 1.0 },
+    ];
+  }
+  if (paneId === "spqrc_panel") {
+    return [
+      { text: "PushUp", value: 9.4 },
+      { text: "PushDown", value: 8.4 },
+      { text: "FadeUp", value: 7.4 },
+      { text: "FadeDown", value: 6.4 },
+      { text: "Noise", value: 5.4 },
+      { text: "粗糙度", value: 4.4 },
+      { text: "区间边际", value: 3.0 },
+      { text: "最终状态", value: 2.0 },
+      { text: "模型模式", value: 1.3 },
     ];
   }
   return [];
+}
+
+function updatePaneLabelPositions() {
+  state.charts.forEach((entry) => {
+    if (!entry.labelOverlay || !entry.labelConfig?.length) {
+      return;
+    }
+    const seriesKey = primarySeriesKeyForPane(entry.paneId);
+    const series = seriesKey ? state.seriesByKey.get(seriesKey) : null;
+    if (!series || typeof series.priceToCoordinate !== "function") {
+      return;
+    }
+    entry.labelElements.forEach((element, index) => {
+      const config = entry.labelConfig[index];
+      const coordinate = series.priceToCoordinate(config.value);
+      if (!Number.isFinite(coordinate)) {
+        element.style.opacity = "0";
+        return;
+      }
+      element.style.opacity = "1";
+      element.style.top = `${coordinate}px`;
+    });
+  });
 }
 
 function formatAxisTimeLabel(time) {
@@ -314,6 +350,14 @@ const els = {
   detailPriceTick: document.getElementById("detail-price-tick"),
   detailContractMonth: document.getElementById("detail-contract-month"),
   detailVolumeMultiple: document.getElementById("detail-volume-multiple"),
+  spqrcDetailCard: document.getElementById("spqrc-detail-card"),
+  spqrcDominantState: document.getElementById("spqrc-dominant-state"),
+  spqrcDominantProb: document.getElementById("spqrc-dominant-prob"),
+  spqrcModelMode: document.getElementById("spqrc-model-mode"),
+  spqrcStateSignal: document.getElementById("spqrc-state-signal"),
+  spqrcRoughness: document.getElementById("spqrc-roughness"),
+  spqrcEdge: document.getElementById("spqrc-edge"),
+  spqrcAdvice: document.getElementById("spqrc-advice"),
   indicatorForm: document.getElementById("indicator-form"),
   chartStack: document.getElementById("chart-stack"),
   error: document.getElementById("error-message"),
@@ -559,6 +603,92 @@ function renderProviderMeta(payload) {
   els.detailPriceTick.textContent = formatNumberValue(detail.price_tick, 4);
   els.detailContractMonth.textContent = formatDetailValue(detail.contract_month);
   els.detailVolumeMultiple.textContent = formatNumberValue(detail.volume_multiple, 0);
+}
+
+function latestDefinedValue(points) {
+  if (!Array.isArray(points)) {
+    return null;
+  }
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const value = points[index]?.value;
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function renderSpqrcSummary(snapshot) {
+  const panel = (snapshot.indicators || []).find((item) => item.id === "spqrc_panel");
+  if (!panel) {
+    els.spqrcDetailCard.hidden = true;
+    return;
+  }
+
+  const latestBySeries = new Map(panel.series.map((series) => [series.id, latestDefinedValue(series.data)]));
+  const states = [
+    ["push_up", latestBySeries.get("spqrc_push_up_prob")],
+    ["push_down", latestBySeries.get("spqrc_push_down_prob")],
+    ["fade_up", latestBySeries.get("spqrc_fade_up_prob")],
+    ["fade_down", latestBySeries.get("spqrc_fade_down_prob")],
+    ["noise", latestBySeries.get("spqrc_noise_prob")],
+  ].filter((item) => typeof item[1] === "number");
+
+  const labelMap = {
+    push_up: "推进偏多",
+    push_down: "推进偏空",
+    fade_up: "上破衰竭",
+    fade_down: "下破衰竭",
+    noise: "噪声",
+  };
+  const stateSignalMap = {
+    1: "推多",
+    "-1": "推空",
+    0.5: "假空",
+    "-0.5": "假多",
+    0: "中性",
+  };
+
+  let dominantState = "--";
+  let dominantProb = "--";
+  if (states.length > 0) {
+    states.sort((a, b) => Number(b[1]) - Number(a[1]));
+    dominantState = labelMap[states[0][0]] || states[0][0];
+    dominantProb = `${(Number(states[0][1]) * 100).toFixed(1)}%`;
+  }
+
+  const modelMode = latestBySeries.get("spqrc_model_mode");
+  const stateSignal = latestBySeries.get("spqrc_state_signal");
+  const roughness = latestBySeries.get("spqrc_roughness_score");
+  const edge = latestBySeries.get("spqrc_edge_score");
+  const noiseProb = latestBySeries.get("spqrc_noise_prob");
+
+  let advice = "回避";
+  if (typeof stateSignal === "number") {
+    if (noiseProb > 0.55 || roughness > 0.72) {
+      advice = "回避";
+    } else if (stateSignal >= 0.75 || dominantState === "推进偏多") {
+      advice = "偏多";
+    } else if (stateSignal <= -0.75 || dominantState === "推进偏空") {
+      advice = "偏空";
+    } else if (dominantState === "上破衰竭") {
+      advice = "偏空";
+    } else if (dominantState === "下破衰竭") {
+      advice = "偏多";
+    }
+  }
+
+  els.spqrcDominantState.textContent = dominantState;
+  els.spqrcDominantProb.textContent = dominantProb;
+  els.spqrcModelMode.textContent = modelMode && modelMode > 0.5 ? "模型" : "规则回退";
+  els.spqrcStateSignal.textContent =
+    stateSignalMap[String(stateSignal)] ||
+    stateSignalMap[stateSignal] ||
+    (typeof stateSignal === "number" ? stateSignal.toFixed(2) : "--");
+  els.spqrcRoughness.textContent = typeof roughness === "number" ? roughness.toFixed(3) : "--";
+  els.spqrcEdge.textContent = typeof edge === "number" ? edge.toFixed(3) : "--";
+  els.spqrcAdvice.textContent = advice;
+  els.spqrcDetailCard.hidden = false;
 }
 
 function hasDuckdbLocalData(contract) {
@@ -1163,6 +1293,8 @@ function rebuildCharts() {
     els.chartStack.appendChild(pane);
 
     const paneLabels = paneLabelConfig(paneId);
+    let labelOverlay = null;
+    let labelElements = [];
     if (paneLabels.length > 0) {
       const overlay = document.createElement("div");
       overlay.className = "pane-label-overlay";
@@ -1170,10 +1302,11 @@ function rebuildCharts() {
         const label = document.createElement("div");
         label.className = "pane-label-tag";
         label.textContent = item.text;
-        label.style.top = item.top;
         overlay.appendChild(label);
+        labelElements.push(label);
       });
       pane.appendChild(overlay);
+      labelOverlay = overlay;
     }
 
     const chart = LightweightCharts.createChart(pane, {
@@ -1182,7 +1315,7 @@ function rebuildCharts() {
       ...chartTheme,
     });
 
-    state.charts.push({ paneId, container: pane, chart });
+    state.charts.push({ paneId, container: pane, chart, labelOverlay, labelElements, labelConfig: paneLabels });
     chart.subscribeCrosshairMove((param) => {
       syncCrosshair(paneId, param);
     });
@@ -1354,6 +1487,7 @@ function applySnapshot(snapshot) {
     state.activeRangeTicks
   );
   renderProviderMeta(snapshot);
+  renderSpqrcSummary(snapshot);
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;
@@ -1461,6 +1595,7 @@ function applySnapshot(snapshot) {
     state.pendingHistoryRange = null;
     state.historyExpandInFlight = false;
   }
+  updatePaneLabelPositions();
 }
 
 async function refreshSnapshot() {
@@ -1558,6 +1693,7 @@ function resizeCharts() {
       height: entry.container.clientHeight,
     });
   });
+  updatePaneLabelPositions();
 }
 
 async function boot() {

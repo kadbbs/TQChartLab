@@ -25,6 +25,9 @@
 - 支持把历史 `tick` 归档到 `DuckDB`
 - 支持把原生 `1m / 5m / 10m / 15m` K 线写入本地 `DuckDB`
 - 本地源优先使用“最接近的现成数据”
+- 支持 `5分钟仿订单流` 实时/本地双链路显示
+- 支持 `SPQRC` 模型信号、状态面板与侧栏结论卡片
+- 支持独立的 `SPQRC` 训练工程，并可把训练 bundle 接回前端运行时
 
 ## 项目结构
 
@@ -43,6 +46,8 @@
 │   ├── data_sources/
 │   └── indicators/
 ├── tick_archive/
+├── orderflow/
+├── spqrc_lab/
 ├── scripts/
 ├── data/
 │   └── duckdb/
@@ -204,6 +209,9 @@ pyinstaller --clean tq_chart_workbench.spec
 - `ATR Bands`
 - `MACD`
 - `SMA 20`
+- `5分钟仿订单流`
+- `SPQRC 信号`
+- `SPQRC 面板`
 
 ### 当前自定义指标
 
@@ -216,6 +224,64 @@ pyinstaller --clean tq_chart_workbench.spec
 - `开仓许可线`
 - `起爆捕捉逻辑`
 - `震荡破裂启动识别`
+
+### 订单流与 SPQRC
+
+#### 5分钟仿订单流
+
+系统现在内置一个独立的 `5分钟仿订单流` 指标：
+
+- `tq` 在线源下：
+  - 只有在你勾选该指标时，后端才会启用订单流计算
+  - 实时链路使用独立 `tick` 通道
+  - 运行时会从当前启用时刻开始做增量聚合
+- `duckdb` 本地源下：
+  - 基于本地 `tick` 回放重建 `5分钟` 内部状态
+
+当前界面主要显示 5 个二值条件：
+
+- `Delta>0`
+- `DeltaRatio>均值20`
+- `dOI>0`
+- `盘口尾值>0`
+- `Efficiency>中位20`
+
+#### SPQRC 信号与面板
+
+`SPQRC` 是项目里当前最接近“数学驱动单品种 5 分钟策略框架”的信号层，目标是把：
+
+- 路径几何（path/signature proxy）
+- 盘口压力（queue pressure）
+- 在线区间（conformal-style interval）
+- 粗糙度过滤（roughness proxy）
+
+压缩成能实时显示、后续能继续训练迭代的一套信号。
+
+前端现在提供两个指标：
+
+- `SPQRC 信号`
+  - 主图上显示：
+    - `模多 / 模空 / 模假多 / 模假空`
+    - 若没有加载训练 bundle，则回退为：
+      - `规多 / 规空 / 规假多 / 规假空`
+- `SPQRC 面板`
+  - 副图显示：
+    - `PushUp / PushDown / FadeUp / FadeDown / Noise` 概率热力条
+    - `粗糙度`
+    - `区间边际`
+    - `最终状态`
+    - `模型模式(1=模型 / 0=规则回退)`
+
+左侧信息栏还会额外显示：
+
+- `SPQRC 当前结论`
+  - 主状态
+  - 最高概率
+  - 模型模式
+  - 最终状态
+  - 粗糙度
+  - 区间边际
+  - 当前建议：`偏多 / 偏空 / 回避`
 
 ## 自定义指标
 
@@ -249,6 +315,71 @@ pyinstaller --clean tq_chart_workbench.spec
 3. 启动时通过 `--provider` 切换
 
 前端和指标层不用跟着改。
+
+## Orderflow 与 SPQRC 训练工程
+
+### 目录
+
+- `orderflow/`
+  - `pseudo_orderflow.py`
+    5分钟仿订单流特征构建
+  - `realtime.py`
+    `tq` 在线源下的实时增量订单流状态机
+  - `spqrc.py`
+    运行时 `SPQRC` 信号计算与模型 bundle 加载
+- `spqrc_lab/`
+  - `features.py`
+    训练用 `500ms` 路径 / `5分钟` 标签特征集
+  - `train.py`
+    状态分类、分位数回归与简易 conformal 校准
+  - `README.md`
+    训练工程说明
+- `run_spqrc_train.py`
+  - 命令行训练入口
+
+### 当前训练流程
+
+训练目标分两块：
+
+- 状态分类：
+  - `push_up`
+  - `push_down`
+  - `fade_up`
+  - `fade_down`
+  - `noise`
+- 未来 `1 bar` 分位数区间：
+  - `q10 / q50 / q90`
+
+这一版属于可运行的 MVP：
+
+- 状态分类：`GradientBoostingClassifier`
+- 分位数回归：`GradientBoostingRegressor(loss="quantile")`
+- 区间校准：简易 calibration residual quantile
+
+### 训练命令
+
+```bash
+./myvenv/bin/python run_spqrc_train.py \
+  --symbol DCE.v2609 \
+  --start 2025-09-15 \
+  --end 2025-09-22 \
+  --output-dir /tmp/spqrc_smoke \
+  --publish-latest
+```
+
+### 训练输出
+
+训练目录里会生成：
+
+- `summary.json`
+- `predictions.csv`
+- `spqrc_runtime_bundle.pkl`
+
+如果带 `--publish-latest`，会额外发布到：
+
+- `spqrc_outputs/latest/spqrc_runtime_bundle.pkl`
+
+运行时 `SPQRC` 指标会自动优先加载这个 bundle。
 
 ## DuckDB 本地存储
 

@@ -11,3 +11,6 @@ release/
 *.egg-info/
 
 experiments/
+
+backtest/
+spqrc_outputs/
