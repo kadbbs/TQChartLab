@@ -4,6 +4,7 @@ from typing import Any
 
 import pandas as pd
 
+from hmm_regime_lab import apply_hull_atr_hmm_runtime
 from orderflow import build_spqrc_signal_frame
 from tq_app.models import IndicatorMeta, IndicatorResult, SeriesDefinition
 
@@ -441,6 +442,120 @@ class SPQRCPanelIndicator(Indicator):
         )
 
 
+class HMMRegimeSignalsIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="hmm_regime_signals",
+        name="HMM 趋势过滤",
+        pane="price",
+        description="Hull 同向且 P(Strong Trend)>0.6 时给出趋势过滤信号。",
+        enabled_by_default=False,
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict[str, Any] | None = None) -> IndicatorResult:
+        df = apply_hull_atr_hmm_runtime(bars)
+        markers: list[dict[str, str | int]] = []
+        trend_up = pd.to_numeric(df.get("hull_up"), errors="coerce").fillna(0.0).gt(0.5)
+        strong_prob = pd.to_numeric(df.get("prob_strong_trend"), errors="coerce").fillna(0.0)
+        allow = strong_prob > 0.6
+        long_mask = trend_up & allow
+        short_mask = (~trend_up) & allow
+        markers.extend(
+            {
+                "time": int(row.time),
+                "position": "belowBar",
+                "color": "#00c853",
+                "shape": "arrowUp",
+                "size": 1,
+                "text": "强多",
+            }
+            for row in df.loc[long_mask, ["time"]].itertuples(index=False)
+        )
+        markers.extend(
+            {
+                "time": int(row.time),
+                "position": "aboveBar",
+                "color": "#f23645",
+                "shape": "arrowDown",
+                "size": 1,
+                "text": "强空",
+            }
+            for row in df.loc[short_mask, ["time"]].itertuples(index=False)
+        )
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=[
+                SeriesDefinition(
+                    id="hmm_regime_signal_anchor",
+                    name="HMM 趋势过滤锚点",
+                    pane="price",
+                    series_type="line",
+                    data=_line_points(df.assign(time=df["time"]), "close"),
+                    options={
+                        "color": "rgba(0,0,0,0)",
+                        "lineWidth": 1,
+                        "priceLineVisible": False,
+                        "lastValueVisible": False,
+                        "markers": markers,
+                    },
+                )
+            ],
+        )
+
+
+class HMMRegimePanelIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="hmm_regime_panel",
+        name="HMM Regime 面板",
+        pane="indicator",
+        description="展示 P(Strong Trend) / P(Slow Trend) / P(Range) 与模型模式。",
+        enabled_by_default=False,
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict[str, Any] | None = None) -> IndicatorResult:
+        df = apply_hull_atr_hmm_runtime(bars)
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=[
+                SeriesDefinition(
+                    id="hmm_prob_strong",
+                    name="P(Strong Trend)",
+                    pane="indicator",
+                    series_type="histogram",
+                    data=_probability_heat_points(df.assign(time=df["time"]), "prob_strong_trend", 4.0, "#00c853"),
+                    options={"base": 4.0, "priceLineVisible": False, "lastValueVisible": False},
+                ),
+                SeriesDefinition(
+                    id="hmm_prob_slow",
+                    name="P(Slow Trend)",
+                    pane="indicator",
+                    series_type="histogram",
+                    data=_probability_heat_points(df.assign(time=df["time"]), "prob_slow_trend", 3.0, "#ff9800"),
+                    options={"base": 3.0, "priceLineVisible": False, "lastValueVisible": False},
+                ),
+                SeriesDefinition(
+                    id="hmm_prob_range",
+                    name="P(Range)",
+                    pane="indicator",
+                    series_type="histogram",
+                    data=_probability_heat_points(df.assign(time=df["time"]), "prob_range", 2.0, "#888888"),
+                    options={"base": 2.0, "priceLineVisible": False, "lastValueVisible": False},
+                ),
+                SeriesDefinition(
+                    id="hmm_model_mode",
+                    name="模型模式",
+                    pane="indicator",
+                    series_type="line",
+                    data=_line_points(df.assign(time=df["time"], hmm_mode_plot=1.0 + pd.to_numeric(df["model_mode"], errors="coerce").fillna(0.0) * 0.5), "hmm_mode_plot"),
+                    options={"color": "#111111", "lineWidth": 1, "lineStyle": 2, "priceLineVisible": False, "lastValueVisible": False},
+                ),
+            ],
+        )
+
+
 def register_builtin_indicators(registry: IndicatorRegistry) -> None:
     registry.register(AtrBandsIndicator())
     registry.register(MacdIndicator())
@@ -448,3 +563,5 @@ def register_builtin_indicators(registry: IndicatorRegistry) -> None:
     registry.register(PseudoOrderflow5mIndicator())
     registry.register(SPQRCSignalsIndicator())
     registry.register(SPQRCPanelIndicator())
+    registry.register(HMMRegimeSignalsIndicator())
+    registry.register(HMMRegimePanelIndicator())

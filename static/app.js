@@ -64,6 +64,14 @@ function paneLabelConfig(paneId) {
       { text: "模型模式", value: 1.3 },
     ];
   }
+  if (paneId === "hmm_regime_panel") {
+    return [
+      { text: "P(Strong)", value: 4.4 },
+      { text: "P(Slow)", value: 3.4 },
+      { text: "P(Range)", value: 2.4 },
+      { text: "模型模式", value: 1.25 },
+    ];
+  }
   return [];
 }
 
@@ -358,6 +366,14 @@ const els = {
   spqrcRoughness: document.getElementById("spqrc-roughness"),
   spqrcEdge: document.getElementById("spqrc-edge"),
   spqrcAdvice: document.getElementById("spqrc-advice"),
+  hmmDetailCard: document.getElementById("hmm-detail-card"),
+  hmmDominantState: document.getElementById("hmm-dominant-state"),
+  hmmDominantProb: document.getElementById("hmm-dominant-prob"),
+  hmmProbStrong: document.getElementById("hmm-prob-strong"),
+  hmmProbSlow: document.getElementById("hmm-prob-slow"),
+  hmmProbRange: document.getElementById("hmm-prob-range"),
+  hmmModelMode: document.getElementById("hmm-model-mode"),
+  hmmAdvice: document.getElementById("hmm-advice"),
   indicatorForm: document.getElementById("indicator-form"),
   chartStack: document.getElementById("chart-stack"),
   error: document.getElementById("error-message"),
@@ -689,6 +705,56 @@ function renderSpqrcSummary(snapshot) {
   els.spqrcEdge.textContent = typeof edge === "number" ? edge.toFixed(3) : "--";
   els.spqrcAdvice.textContent = advice;
   els.spqrcDetailCard.hidden = false;
+}
+
+function decodeHeatProbability(value, base) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return Math.max(0, Math.min(1, (value - base) / 0.82));
+}
+
+function renderHmmSummary(snapshot) {
+  const panel = (snapshot.indicators || []).find((item) => item.id === "hmm_regime_panel");
+  if (!panel) {
+    els.hmmDetailCard.hidden = true;
+    return;
+  }
+
+  const latestBySeries = new Map(panel.series.map((series) => [series.id, latestDefinedValue(series.data)]));
+  const probStrong = decodeHeatProbability(latestBySeries.get("hmm_prob_strong"), 4.0);
+  const probSlow = decodeHeatProbability(latestBySeries.get("hmm_prob_slow"), 3.0);
+  const probRange = decodeHeatProbability(latestBySeries.get("hmm_prob_range"), 2.0);
+  const modelModeValue = latestBySeries.get("hmm_model_mode");
+  const entries = [
+    ["Strong Trend", probStrong],
+    ["Slow Trend", probSlow],
+    ["Range", probRange],
+  ].filter((item) => typeof item[1] === "number");
+
+  let dominantState = "--";
+  let dominantProb = "--";
+  if (entries.length > 0) {
+    entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+    dominantState = entries[0][0];
+    dominantProb = `${(Number(entries[0][1]) * 100).toFixed(1)}%`;
+  }
+
+  let advice = "观望";
+  if (typeof probStrong === "number" && probStrong > 0.6) {
+    advice = "允许趋势";
+  } else if (typeof probRange === "number" && probRange > 0.6) {
+    advice = "回避趋势";
+  }
+
+  els.hmmDominantState.textContent = dominantState;
+  els.hmmDominantProb.textContent = dominantProb;
+  els.hmmProbStrong.textContent = typeof probStrong === "number" ? `${(probStrong * 100).toFixed(1)}%` : "--";
+  els.hmmProbSlow.textContent = typeof probSlow === "number" ? `${(probSlow * 100).toFixed(1)}%` : "--";
+  els.hmmProbRange.textContent = typeof probRange === "number" ? `${(probRange * 100).toFixed(1)}%` : "--";
+  els.hmmModelMode.textContent = modelModeValue && modelModeValue > 1.25 ? "模型" : "规则回退";
+  els.hmmAdvice.textContent = advice;
+  els.hmmDetailCard.hidden = false;
 }
 
 function hasDuckdbLocalData(contract) {
@@ -1488,6 +1554,7 @@ function applySnapshot(snapshot) {
   );
   renderProviderMeta(snapshot);
   renderSpqrcSummary(snapshot);
+  renderHmmSummary(snapshot);
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;

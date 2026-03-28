@@ -28,6 +28,7 @@
 - 支持 `5分钟仿订单流` 实时/本地双链路显示
 - 支持 `SPQRC` 模型信号、状态面板与侧栏结论卡片
 - 支持独立的 `SPQRC` 训练工程，并可把训练 bundle 接回前端运行时
+- 支持 `Hull + ATR + HMM` Regime 训练、每周滚动更新与前端趋势过滤
 
 ## 项目结构
 
@@ -212,6 +213,8 @@ pyinstaller --clean tq_chart_workbench.spec
 - `5分钟仿订单流`
 - `SPQRC 信号`
 - `SPQRC 面板`
+- `HMM 趋势过滤`
+- `HMM Regime 面板`
 
 ### 当前自定义指标
 
@@ -282,6 +285,116 @@ pyinstaller --clean tq_chart_workbench.spec
   - 粗糙度
   - 区间边际
   - 当前建议：`偏多 / 偏空 / 回避`
+
+## Hull + ATR + HMM Regime
+
+### 思路
+
+这条链路按如下顺序工作：
+
+1. 用 `多空线(Hull)` 的同色连续区间切分 segment
+2. 用 `ATR`、位移、效率、最大回撤、方向纯度给 segment 打标签
+3. 标签类别：
+   - `Range`
+   - `Slow Trend`
+   - `Strong Trend`
+4. 再用 5 个特征训练 `GaussianHMM(3状态)`：
+   - `ADX`
+   - `MA spread`
+   - `Hull slope`
+   - `volatility(ATR)`
+   - `direction consistency`
+5. 输出：
+   - `P(Strong Trend)`
+   - `P(Slow Trend)`
+   - `P(Range)`
+
+### 前端显示
+
+前端现在提供两个 HMM 相关指标：
+
+- `HMM 趋势过滤`
+  - 画在主图
+  - 当 `Hull` 同向且 `P(Strong Trend) > 0.6` 时给出趋势过滤信号
+- `HMM Regime 面板`
+  - 副图显示：
+    - `P(Strong Trend)`
+    - `P(Slow Trend)`
+    - `P(Range)`
+    - `模型模式`
+
+左侧还会显示：
+
+- `HMM 当前结论`
+  - 主状态
+  - 最高概率
+  - `P(Strong) / P(Slow) / P(Range)`
+  - 模型模式
+  - 当前建议：`允许趋势 / 回避趋势 / 观望`
+
+### 独立训练脚本
+
+训练入口：
+
+- [run_hmm_regime_train.py](/home/bs/code/qh/tq/run_hmm_regime_train.py)
+
+示例：
+
+```bash
+./myvenv/bin/python run_hmm_regime_train.py \
+  --train-symbol DCE.v2409 \
+  --train-start 2024-03-20 \
+  --train-end 2024-09-13 \
+  --test-symbol DCE.v2509 \
+  --test-start 2025-09-09 \
+  --test-end 2025-09-12 \
+  --output-dir /tmp/hmm_regime_smoke \
+  --publish-latest
+```
+
+当前默认逻辑就是：
+
+- 训练：`v2409` 的 `2024-03 ~ 2024-09`
+- 测试：`v2509`
+
+训练完成后会输出：
+
+- `train_states.csv`
+- `test_states.csv`
+- `summary.json`
+- `hull_atr_hmm_bundle.json`
+
+如果带 `--publish-latest`，会发布到：
+
+- `hmm_regime_outputs/latest/hull_atr_hmm_bundle.json`
+
+运行时前端会自动优先加载这个 bundle。
+
+### 每周滚动更新
+
+滚动更新入口：
+
+- [scripts/update_hmm_regime_weekly.py](/home/bs/code/qh/tq/scripts/update_hmm_regime_weekly.py)
+
+示例：
+
+```bash
+./myvenv/bin/python scripts/update_hmm_regime_weekly.py \
+  --train-symbol DCE.v2409 \
+  --test-symbol DCE.v2509 \
+  --train-lookback-days 180 \
+  --test-lookback-days 7 \
+  --publish-latest
+```
+
+脚本会：
+
+- 自动读取 DuckDB 当前最新 `5分钟K`
+- 按最近窗口重训
+- 生成 `run_meta.json`
+- 更新 `latest` runtime bundle
+
+这样后续就能按周滚动刷新前端使用的 HMM 模型。
 
 ## 自定义指标
 
