@@ -23,6 +23,16 @@ const state = {
   requestedDataLength: null,
   historyExpandInFlight: false,
   pendingHistoryRange: null,
+  wsConnection: null,
+  wsHeartbeatTimerId: null,
+  wsReconnectTimerId: null,
+  wsActiveSignature: "",
+  wsConnectingSignature: "",
+  wsActualToSyntheticTime: new Map(),
+  wsSyntheticToActualTime: new Map(),
+  wsMaxSyntheticTime: null,
+  wsMaxActualTimeMs: null,
+  indicatorSyncTimerId: null,
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
@@ -40,6 +50,10 @@ const MAX_DUCKDB_DATA_LENGTH = 50000;
 const MAX_DUCKDB_BRICK_LENGTH = 100000;
 const INCREMENTAL_UPDATE_MAX_NEW_BARS = 3;
 const ORDERFLOW_REFRESH_MS = 450;
+const BITGET_WS_URL = "wss://ws.bitget.com/v2/ws/public";
+const BITGET_WS_RECONNECT_MS = 2000;
+const BITGET_WS_HEARTBEAT_MS = 20000;
+const BITGET_INDICATOR_SYNC_MS = 1200;
 
 function paneLabelConfig(paneId) {
   if (paneId === "pseudo_orderflow_5m") {
@@ -350,6 +364,15 @@ const els = {
   detailPriceTick: document.getElementById("detail-price-tick"),
   detailContractMonth: document.getElementById("detail-contract-month"),
   detailVolumeMultiple: document.getElementById("detail-volume-multiple"),
+  bitgetAccountCard: document.getElementById("bitget-account-card"),
+  bitgetProductType: document.getElementById("bitget-product-type"),
+  bitgetMarginCoin: document.getElementById("bitget-margin-coin"),
+  bitgetAccountEquity: document.getElementById("bitget-account-equity"),
+  bitgetUsdtEquity: document.getElementById("bitget-usdt-equity"),
+  bitgetAvailable: document.getElementById("bitget-available"),
+  bitgetLocked: document.getElementById("bitget-locked"),
+  bitgetRiskRate: document.getElementById("bitget-risk-rate"),
+  bitgetAssetMode: document.getElementById("bitget-asset-mode"),
   spqrcDetailCard: document.getElementById("spqrc-detail-card"),
   spqrcDominantState: document.getElementById("spqrc-dominant-state"),
   spqrcDominantProb: document.getElementById("spqrc-dominant-prob"),
@@ -447,6 +470,359 @@ async function fetchJson(url) {
     throw new Error(payload.error || "请求失败");
   }
   return payload;
+}
+
+function shouldUseBrowserPush(provider = getRequestedProvider(), barMode = getRequestedBarMode()) {
+  return provider === "bitget" && barMode === "time";
+}
+
+function bitgetWsChannelForDuration(durationSeconds) {
+  const channelMap = {
+    60: "candle1m",
+    300: "candle5m",
+    900: "candle15m",
+    1800: "candle30m",
+    3600: "candle1H",
+    7200: "candle2H",
+    14400: "candle4H",
+    21600: "candle6H",
+    43200: "candle12H",
+    86400: "candle1D",
+  };
+  return channelMap[durationSeconds] || null;
+}
+
+function requestedWsSignature() {
+  const provider = getRequestedProvider();
+  const barMode = getRequestedBarMode();
+  const durationSeconds = getRequestedDuration();
+  const symbol = getRequestedSymbol();
+  if (!shouldUseBrowserPush(provider, barMode)) {
+    return "";
+  }
+  const channel = bitgetWsChannelForDuration(durationSeconds);
+  if (!channel || !symbol) {
+    return "";
+  }
+  return `${provider}|${symbol}|${durationSeconds}|${barMode}`;
+}
+
+function clearBitgetHeartbeat() {
+  if (state.wsHeartbeatTimerId) {
+    window.clearInterval(state.wsHeartbeatTimerId);
+    state.wsHeartbeatTimerId = null;
+  }
+}
+
+function clearBitgetReconnect() {
+  if (state.wsReconnectTimerId) {
+    window.clearTimeout(state.wsReconnectTimerId);
+    state.wsReconnectTimerId = null;
+  }
+}
+
+function disconnectBitgetStream() {
+  clearBitgetHeartbeat();
+  clearBitgetReconnect();
+  if (state.indicatorSyncTimerId) {
+    window.clearTimeout(state.indicatorSyncTimerId);
+    state.indicatorSyncTimerId = null;
+  }
+  if (state.wsConnection) {
+    const socket = state.wsConnection;
+    state.wsConnection = null;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+  }
+  state.wsActiveSignature = "";
+  state.wsConnectingSignature = "";
+}
+
+function scheduleBitgetReconnect(signature) {
+  clearBitgetReconnect();
+  if (!signature || signature !== requestedWsSignature()) {
+    return;
+  }
+  state.wsReconnectTimerId = window.setTimeout(() => {
+    state.wsReconnectTimerId = null;
+    connectBitgetStream();
+  }, BITGET_WS_RECONNECT_MS);
+}
+
+function startBitgetHeartbeat(socket, signature) {
+  clearBitgetHeartbeat();
+  state.wsHeartbeatTimerId = window.setInterval(() => {
+    if (state.wsActiveSignature !== signature || socket.readyState !== WebSocket.OPEN) {
+      clearBitgetHeartbeat();
+      return;
+    }
+    socket.send("ping");
+  }, BITGET_WS_HEARTBEAT_MS);
+}
+
+function formatWsDisplayTime(timestampMs) {
+  const date = new Date(timestampMs);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function rebuildWsTimeIndex(snapshot) {
+  state.wsActualToSyntheticTime = new Map();
+  state.wsSyntheticToActualTime = new Map();
+  state.wsMaxSyntheticTime = null;
+  state.wsMaxActualTimeMs = null;
+
+  (snapshot.candles || []).forEach((candle) => {
+    const syntheticTime = Number(candle.time);
+    const label = snapshot.time_labels?.[String(syntheticTime)];
+    if (!label) {
+      return;
+    }
+    const actualTimeMs = Date.parse(label.replace(" ", "T"));
+    if (!Number.isFinite(actualTimeMs)) {
+      return;
+    }
+    state.wsActualToSyntheticTime.set(actualTimeMs, syntheticTime);
+    state.wsSyntheticToActualTime.set(syntheticTime, actualTimeMs);
+    state.wsMaxSyntheticTime = state.wsMaxSyntheticTime === null ? syntheticTime : Math.max(state.wsMaxSyntheticTime, syntheticTime);
+    state.wsMaxActualTimeMs = state.wsMaxActualTimeMs === null ? actualTimeMs : Math.max(state.wsMaxActualTimeMs, actualTimeMs);
+  });
+}
+
+function resolveSyntheticTime(actualTimeMs) {
+  const existing = state.wsActualToSyntheticTime.get(actualTimeMs);
+  if (existing !== undefined) {
+    return { syntheticTime: existing, isNewBar: false };
+  }
+  if (state.wsMaxActualTimeMs !== null && actualTimeMs < state.wsMaxActualTimeMs) {
+    return { syntheticTime: null, isNewBar: false };
+  }
+  const syntheticTime = (state.wsMaxSyntheticTime ?? 0) + 1;
+  state.wsActualToSyntheticTime.set(actualTimeMs, syntheticTime);
+  state.wsSyntheticToActualTime.set(syntheticTime, actualTimeMs);
+  state.wsMaxSyntheticTime = syntheticTime;
+  state.wsMaxActualTimeMs = actualTimeMs;
+  return { syntheticTime, isNewBar: true };
+}
+
+function syncCurrentPriceLine(price, color) {
+  const candleSeries = state.seriesByKey.get("candles");
+  if (!candleSeries) {
+    return;
+  }
+  if (state.currentPriceLine) {
+    candleSeries.removePriceLine(state.currentPriceLine);
+  }
+  state.currentPriceLine = candleSeries.createPriceLine({
+    price,
+    color,
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: "现价",
+  });
+}
+
+function scheduleIndicatorSnapshotSync() {
+  if (!shouldUseBrowserPush(state.activeProvider, state.activeBarMode) || state.selectedIndicators.length === 0) {
+    return;
+  }
+  if (state.indicatorSyncTimerId) {
+    window.clearTimeout(state.indicatorSyncTimerId);
+  }
+  state.indicatorSyncTimerId = window.setTimeout(async () => {
+    state.indicatorSyncTimerId = null;
+    try {
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  }, BITGET_INDICATOR_SYNC_MS);
+}
+
+function applyBitgetWsCandleUpdate(rawRow) {
+  if (!Array.isArray(rawRow) || rawRow.length < 6) {
+    return;
+  }
+  const actualTimeMs = Number(rawRow[0]);
+  if (!Number.isFinite(actualTimeMs)) {
+    return;
+  }
+  const { syntheticTime, isNewBar } = resolveSyntheticTime(actualTimeMs);
+  if (!Number.isFinite(syntheticTime)) {
+    return;
+  }
+
+  const open = Number(rawRow[1]);
+  const high = Number(rawRow[2]);
+  const low = Number(rawRow[3]);
+  const close = Number(rawRow[4]);
+  const volume = Number(rawRow[5]);
+  if (![open, high, low, close].every(Number.isFinite)) {
+    return;
+  }
+
+  const displayTime = formatWsDisplayTime(actualTimeMs);
+  state.timeLabels.set(String(syntheticTime), displayTime);
+
+  const candles = [...(state.seriesDataByKey.get("candles") || [])];
+  const volumeSeriesData = [...(state.seriesDataByKey.get("volume") || [])];
+  const nextCandle = { time: syntheticTime, open, high, low, close };
+  const nextVolume = {
+    time: syntheticTime,
+    value: Number.isFinite(volume) ? volume : 0,
+    color: close >= open ? "#089981" : "#f23645",
+  };
+  const existingIndex = candles.findIndex((item) => Number(item?.time) === syntheticTime);
+  if (existingIndex >= 0) {
+    candles[existingIndex] = nextCandle;
+    volumeSeriesData[existingIndex] = nextVolume;
+  } else {
+    candles.push(nextCandle);
+    volumeSeriesData.push(nextVolume);
+  }
+
+  const maxLength = currentRequestedDataLength();
+  while (candles.length > maxLength) {
+    const removed = candles.shift();
+    volumeSeriesData.shift();
+    if (removed) {
+      const removedSynthetic = Number(removed.time);
+      const removedActual = state.wsSyntheticToActualTime.get(removedSynthetic);
+      if (removedActual !== undefined) {
+        state.wsSyntheticToActualTime.delete(removedSynthetic);
+        state.wsActualToSyntheticTime.delete(removedActual);
+      }
+      state.timeLabels.delete(String(removedSynthetic));
+    }
+  }
+
+  const candleSeries = state.seriesByKey.get("candles");
+  const volumeSeries = state.seriesByKey.get("volume");
+  setSeriesData("candles", candleSeries, candles);
+  setSeriesData("volume", volumeSeries, volumeSeriesData);
+
+  els.lastPrice.textContent = close.toFixed(2);
+  els.lastPrice.style.color = close >= open ? "#089981" : "#f23645";
+  els.lastUpdate.textContent = displayTime;
+  syncCurrentPriceLine(close, close >= open ? "#089981" : "#f23645");
+  updatePaneLabelPositions();
+
+  if (isNewBar) {
+    scheduleIndicatorSnapshotSync();
+  }
+}
+
+function handleBitgetWsMessage(event) {
+  if (typeof event.data !== "string" || !event.data || event.data === "pong") {
+    return;
+  }
+  const payload = JSON.parse(event.data);
+  if (payload.event === "subscribe" || payload.event === "unsubscribe") {
+    return;
+  }
+  if (payload.event === "error") {
+    throw new Error(payload.msg || payload.code || "Bitget 订阅失败");
+  }
+  const rows = payload.data || [];
+  rows.forEach((row) => applyBitgetWsCandleUpdate(row));
+}
+
+function connectBitgetStream() {
+  const signature = requestedWsSignature();
+  if (!signature) {
+    disconnectBitgetStream();
+    return;
+  }
+  if (
+    state.wsConnection &&
+    state.wsActiveSignature === signature &&
+    (state.wsConnection.readyState === WebSocket.OPEN || state.wsConnection.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+
+  disconnectBitgetStream();
+  const channel = bitgetWsChannelForDuration(getRequestedDuration());
+  if (!channel) {
+    return;
+  }
+
+  const socket = new WebSocket(BITGET_WS_URL);
+  state.wsConnection = socket;
+  state.wsConnectingSignature = signature;
+
+  socket.onopen = () => {
+    if (state.wsConnection !== socket) {
+      socket.close();
+      return;
+    }
+    state.wsActiveSignature = signature;
+    state.wsConnectingSignature = "";
+    els.error.textContent = "";
+    socket.send(
+      JSON.stringify({
+        op: "subscribe",
+        args: [
+          {
+            instType: "USDT-FUTURES",
+            channel,
+            instId: getRequestedSymbol(),
+          },
+        ],
+      })
+    );
+    startBitgetHeartbeat(socket, signature);
+  };
+
+  socket.onmessage = (event) => {
+    if (state.wsConnection !== socket || state.wsActiveSignature !== signature) {
+      return;
+    }
+    try {
+      handleBitgetWsMessage(event);
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  };
+
+  socket.onerror = () => {
+    if (state.wsConnection === socket && state.wsActiveSignature === signature) {
+      els.error.textContent = "Bitget 实时连接异常，正在重连。";
+    }
+  };
+
+  socket.onclose = () => {
+    if (state.wsConnection === socket) {
+      state.wsConnection = null;
+    }
+    clearBitgetHeartbeat();
+    const shouldReconnect = requestedWsSignature() === signature;
+    if (state.wsActiveSignature === signature) {
+      state.wsActiveSignature = "";
+    }
+    if (shouldReconnect) {
+      scheduleBitgetReconnect(signature);
+    }
+  };
+}
+
+function syncRealtimeTransport() {
+  if (shouldUseBrowserPush()) {
+    connectBitgetStream();
+    return;
+  }
+  disconnectBitgetStream();
 }
 
 function getIndicatorIds() {
@@ -603,6 +979,18 @@ function renderProviderMeta(payload) {
   els.detailPriceTick.textContent = formatNumberValue(detail.price_tick, 4);
   els.detailContractMonth.textContent = formatDetailValue(detail.contract_month);
   els.detailVolumeMultiple.textContent = formatNumberValue(detail.volume_multiple, 0);
+
+  const account = payload.provider_account || {};
+  const hasBitgetAccount = provider === "bitget" && Object.keys(account).length > 0;
+  els.bitgetAccountCard.hidden = !hasBitgetAccount;
+  els.bitgetProductType.textContent = formatDetailValue(account.product_type);
+  els.bitgetMarginCoin.textContent = formatDetailValue(account.margin_coin);
+  els.bitgetAccountEquity.textContent = formatDetailValue(account.account_equity);
+  els.bitgetUsdtEquity.textContent = formatDetailValue(account.usdt_equity);
+  els.bitgetAvailable.textContent = formatDetailValue(account.available);
+  els.bitgetLocked.textContent = formatDetailValue(account.locked);
+  els.bitgetRiskRate.textContent = formatDetailValue(account.crossed_risk_rate);
+  els.bitgetAssetMode.textContent = formatDetailValue(account.asset_mode);
 }
 
 function latestDefinedValue(points) {
@@ -1473,6 +1861,7 @@ function applySnapshot(snapshot) {
   state.config.range_ticks = nextRangeTicks;
   state.config.brick_length = nextBrickLength;
   state.timeLabels = new Map(Object.entries(snapshot.time_labels || {}));
+  rebuildWsTimeIndex(snapshot);
   els.symbolSelect.value = snapshot.symbol;
   els.providerSelect.value = state.activeProvider;
   els.barModeSelect.value = state.activeBarMode;
@@ -1600,12 +1989,21 @@ function applySnapshot(snapshot) {
 
 async function refreshSnapshot() {
   const requestId = ++state.snapshotRequestId;
+  const requestedProvider = getRequestedProvider();
+  const requestedSymbol = getRequestedSymbol();
   const snapshot = await fetchSnapshotPayload();
   if (requestId !== state.snapshotRequestId) {
     return;
   }
+  if (
+    snapshot.provider !== requestedProvider ||
+    snapshot.symbol !== requestedSymbol
+  ) {
+    return;
+  }
   applySnapshot(snapshot);
   syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
+  syncRealtimeTransport();
 }
 
 async function fetchSnapshotPayload() {
@@ -1643,12 +2041,25 @@ async function refreshConfig(provider) {
   state.config = nextConfig;
   state.activeProvider = nextConfig.provider;
   state.activeSymbol = nextConfig.symbol;
+  state.activeDurationSeconds = nextConfig.duration_seconds;
+  state.activeBarMode = nextConfig.bar_mode || "time";
+  state.activeRangeTicks = nextConfig.range_ticks || state.activeRangeTicks || 10;
   state.activeBrickLength = nextConfig.brick_length || state.activeBrickLength || 10000;
   state.requestedDataLength = nextConfig.data_length || state.requestedDataLength || 800;
+  state.config.provider = nextConfig.provider;
+  state.config.symbol = nextConfig.symbol;
+  state.config.duration_seconds = nextConfig.duration_seconds;
+  state.config.bar_mode = nextConfig.bar_mode || "time";
+  state.config.range_ticks = nextConfig.range_ticks || 10;
   buildProviderOptions(nextConfig.providers || [], nextConfig.provider);
   buildContractOptions(nextConfig.contracts || [], nextConfig.symbol);
   buildBarModeOptions(nextConfig.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
   buildDurationOptions(nextConfig.duration_options || [nextConfig.duration_seconds], nextConfig.duration_seconds);
+  els.providerSelect.value = nextConfig.provider;
+  els.symbolSelect.value = nextConfig.symbol;
+  els.barModeSelect.value = state.activeBarMode;
+  els.durationSelect.value = String(nextConfig.duration_seconds);
+  els.rangeTicksInput.value = String(state.activeRangeTicks);
   els.brickLengthInput.value = String(state.activeBrickLength);
   syncMarketHeader(
     nextConfig.symbol_label || nextConfig.symbol,
@@ -1661,13 +2072,20 @@ async function refreshConfig(provider) {
 }
 
 function syncAutoRefresh(refreshMs) {
+  if (shouldUseBrowserPush()) {
+    if (state.refreshTimerId) {
+      window.clearInterval(state.refreshTimerId);
+      state.refreshTimerId = null;
+    }
+    return;
+  }
   if (state.refreshTimerId) {
     window.clearInterval(state.refreshTimerId);
     state.refreshTimerId = null;
   }
   let effectiveRefreshMs = refreshMs;
   if (
-    state.activeProvider === "tq" &&
+    state.activeProvider === "bitget" &&
     state.activeBarMode === "time" &&
     getRequestedDuration() === 300 &&
     state.selectedIndicators.includes("pseudo_orderflow_5m")
@@ -1724,12 +2142,14 @@ async function boot() {
     state.activeRangeTicks
   );
   renderProviderMeta(state.config);
+  rebuildWsTimeIndex({ candles: [], time_labels: {} });
 
   els.symbolSelect.addEventListener("change", async () => {
     try {
       state.activeSymbol = getRequestedSymbol();
       state.config.symbol = state.activeSymbol;
       els.error.textContent = "";
+      syncRealtimeTransport();
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
@@ -1738,7 +2158,16 @@ async function boot() {
   els.providerSelect.addEventListener("change", async () => {
     const nextProvider = getRequestedProvider();
     try {
+      state.snapshotRequestId += 1;
+      disconnectBitgetStream();
+      if (state.refreshTimerId) {
+        window.clearInterval(state.refreshTimerId);
+        state.refreshTimerId = null;
+      }
       await refreshConfig(nextProvider);
+      els.lastPrice.textContent = "--";
+      els.lastUpdate.textContent = "--";
+      els.cursorTime.textContent = "--";
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
@@ -1756,6 +2185,7 @@ async function boot() {
     }
     syncBarModeControls(nextBarMode);
     try {
+      syncRealtimeTransport();
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
@@ -1763,6 +2193,7 @@ async function boot() {
   });
   els.durationSelect.addEventListener("change", async () => {
     try {
+      syncRealtimeTransport();
       await refreshSnapshot();
     } catch (error) {
       els.error.textContent = error.message;
@@ -1786,6 +2217,9 @@ async function boot() {
   buildIndicatorSelector(state.config.indicators, state.config.default_indicator_ids);
   rebuildCharts();
   await refreshSnapshot();
+  window.addEventListener("beforeunload", () => {
+    disconnectBitgetStream();
+  });
 }
 
 window.addEventListener("resize", resizeCharts);

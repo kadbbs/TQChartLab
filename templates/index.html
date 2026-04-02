@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TQ Market Chart</title>
+  <title>Bitget Market Chart</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
   <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -12,7 +12,7 @@
     <aside class="sidebar">
       <div class="brand">
         <div class="eyebrow">Market Workbench</div>
-        <h1 id="page-title">TQ 行情图表</h1>
+        <h1 id="page-title">Bitget 行情图表</h1>
       </div>
       <div class="panel">
         <div class="panel-label">行情</div>
@@ -75,6 +75,43 @@
             <div class="detail-item">
               <span>交易乘数</span>
               <strong id="detail-volume-multiple">--</strong>
+            </div>
+          </div>
+        </div>
+        <div id="bitget-account-card" class="detail-card" hidden>
+          <div class="detail-card-title">Bitget 账户摘要</div>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <span>产品类型</span>
+              <strong id="bitget-product-type">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>保证金币种</span>
+              <strong id="bitget-margin-coin">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>账户权益</span>
+              <strong id="bitget-account-equity">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>USDT权益</span>
+              <strong id="bitget-usdt-equity">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>可用余额</span>
+              <strong id="bitget-available">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>冻结余额</span>
+              <strong id="bitget-locked">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>风险率</span>
+              <strong id="bitget-risk-rate">--</strong>
+            </div>
+            <div class="detail-item">
+              <span>资产模式</span>
+              <strong id="bitget-asset-mode">--</strong>
             </div>
           </div>
         </div>

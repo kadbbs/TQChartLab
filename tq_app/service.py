@@ -7,8 +7,10 @@ from typing import Any
 
 import pandas as pd
 
-from tq_app.contracts import format_contract_label, load_duckdb_contract_catalog, load_tq_contract_catalog
+from tq_app.contracts import format_contract_label, load_bitget_contract_catalog, load_duckdb_contract_catalog
+from tq_app.data_sources.bitget import load_bitget_account_summary
 from tq_app.data_sources import DataSource, create_data_source, get_available_data_sources
+from tq_app.data_sources.bitget import GRANULARITY_MAP
 from tq_app.indicators import build_indicator_registry
 from tq_app.models import IndicatorMeta, IndicatorResult
 
@@ -87,17 +89,20 @@ class MarketDataService:
             if effective_provider != "duckdb" or _contract_has_local_data(current_contract):
                 selected_symbol = self.symbol
         indicator_meta = [asdict(meta) for meta in self.indicators.list_meta()]
+        duration_options = self._duration_options_for_provider(effective_provider)
+        bar_modes = self._bar_modes_for_provider(effective_provider)
         return {
             "provider": effective_provider,
             "providers": get_available_data_sources(),
             "symbol": selected_symbol,
             "symbol_label": self._symbol_label(effective_provider, selected_symbol),
             "provider_hint": self._provider_hint(effective_provider),
+            "provider_account": self._provider_account(effective_provider),
             "contract_detail": self._contract_detail(effective_provider, selected_symbol),
             "duration_seconds": self.duration_seconds,
-            "duration_options": DEFAULT_DURATION_OPTIONS,
+            "duration_options": duration_options,
             "bar_mode": self.bar_mode,
-            "bar_modes": DEFAULT_BAR_MODES,
+            "bar_modes": bar_modes,
             "range_ticks": self.range_ticks,
             "data_length": self.data_length,
             "brick_length": self.brick_length,
@@ -159,6 +164,7 @@ class MarketDataService:
             "symbol_label": self._symbol_label(effective_provider, effective_symbol),
             "provider": effective_provider,
             "provider_hint": self._provider_hint(effective_provider),
+            "provider_account": self._provider_account(effective_provider),
             "refresh_ms": self._refresh_interval_ms(effective_provider),
             "contract_detail": self._contract_detail(effective_provider, effective_symbol),
             "duration_seconds": effective_duration,
@@ -180,9 +186,9 @@ class MarketDataService:
         if cached is not None:
             return cached
 
-        if provider == "tq":
+        if provider == "bitget":
             try:
-                contracts = load_tq_contract_catalog(self.project_root)
+                contracts = load_bitget_contract_catalog(self.project_root)
             except Exception:
                 contracts = []
         elif provider == "duckdb":
@@ -279,18 +285,38 @@ class MarketDataService:
             return {}
         return dict(contract)
 
+    def _provider_account(self, provider: str) -> dict[str, Any]:
+        if provider == "bitget":
+            try:
+                return load_bitget_account_summary(self.project_root)
+            except Exception:
+                return {}
+        return {}
+
     @staticmethod
     def _provider_hint(provider: str) -> str:
         if provider == "duckdb":
             return "当前使用本地 DuckDB 回放库。系统会优先使用最接近的本地现成数据源；例如 5 分钟 K 线会优先读取 market_bars_5m，缺失时再回退到本地 tick 重建。"
-        if provider == "tq":
-            return "当前使用天勤在线行情。合约目录来自天勤，图表会按在线数据实时刷新。"
+        if provider == "bitget":
+            return "当前使用 Bitget 公共行情。后端通过 WebSocket 订阅实时 K 线，页面按短周期读取最新缓存，不包含交易下单。"
         return ""
 
     def _refresh_interval_ms(self, provider: str) -> int:
         if provider == "duckdb":
             return 0
         return self.refresh_ms
+
+    @staticmethod
+    def _duration_options_for_provider(provider: str) -> list[int]:
+        if provider == "bitget":
+            return [seconds for seconds in DEFAULT_DURATION_OPTIONS if seconds in GRANULARITY_MAP]
+        return DEFAULT_DURATION_OPTIONS
+
+    @staticmethod
+    def _bar_modes_for_provider(provider: str) -> list[dict[str, Any]]:
+        if provider == "bitget":
+            return [item for item in DEFAULT_BAR_MODES if item["id"] == "time"]
+        return DEFAULT_BAR_MODES
 
     @staticmethod
     def _with_chart_time(bars: pd.DataFrame, bar_mode: str) -> pd.DataFrame:

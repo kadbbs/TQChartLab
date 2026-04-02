@@ -12,7 +12,7 @@ from orderflow import merge_5m_pseudo_orderflow_into_bars
 from .base import DataSource
 from .transforms import build_range_bars, build_renko_bars, build_tick_bars, build_time_bars_from_ticks, normalize_ticks
 
-DEFAULT_STORAGE_PROVIDER = "tq"
+DEFAULT_STORAGE_PROVIDER = "bitget"
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "duckdb" / "ticks.duckdb"
 NATIVE_BAR_TABLES = {
     60: "market_bars_1m",

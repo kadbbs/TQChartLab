@@ -1,1 +1,1 @@
-"""Application package for the TQ chart demo."""
+"""Application package for the market chart workbench."""
