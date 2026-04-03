@@ -5,8 +5,8 @@
 当前默认目标：
 
 - 数据源：`bitget`
-- 默认合约：`XAUUSDT`
-- 默认周期：`5m`
+- 默认合约：`BTCUSDT`
+- 默认周期：`1m`
 - 实时方式：浏览器直连 Bitget WebSocket
 
 ## 当前状态
@@ -30,13 +30,14 @@
 - 支持十字光标联动和时间标签映射
 - 支持内置指标和 `custom_indicators.py` 动态加载
 - 支持 Bitget 实时推送下的图表增量更新
+- 支持独立的 WebGL 订单流矩阵 pane
 - 支持后端快照接口补充指标和侧栏信息
 
 ## 实时链路
 
 当前实时模式分两层：
 
-- K 线与成交量：
+- K 线、逐笔成交与盘口：
   浏览器直接连接 `wss://ws.bitget.com/v2/ws/public`
 - 指标与侧栏摘要：
   由后端 `/api/snapshot` 计算并返回
@@ -45,6 +46,7 @@
 
 - 价格主图不再依赖前端定时轮询
 - 切换品种和周期后，前端会重建 WebSocket 订阅
+- `Orderflow GL` 会消费 `candle + trade + books15`
 - 指标不是每一帧都前端本地计算，仍保留后端参与
 
 ## 项目结构
@@ -139,8 +141,8 @@ http://127.0.0.1:8050
 ```bash
 ./myvenv/bin/python web_tq_chart.py \
   --provider bitget \
-  --symbol XAUUSDT \
-  --duration 300 \
+  --symbol BTCUSDT \
+  --duration 60 \
   --length 800 \
   --bar-mode time \
   --refresh-ms 1000 \
@@ -151,7 +153,7 @@ http://127.0.0.1:8050
 参数说明：
 
 - `--provider`：当前主用 `bitget`，也可切到 `duckdb`
-- `--symbol`：默认合约，例如 `XAUUSDT`
+- `--symbol`：默认合约，例如 `BTCUSDT`
 - `--duration`：时间 K 周期，单位秒
 - `--length`：默认拉取根数
 - `--bar-mode`：当前 Bitget 主链路只建议使用 `time`
@@ -187,7 +189,7 @@ http://127.0.0.1:8050
 示例：
 
 ```text
-/api/snapshot?provider=bitget&symbol=XAUUSDT&duration_seconds=300&bar_mode=time&data_length=200&indicators=macd,atr_bands
+/api/snapshot?provider=bitget&symbol=BTCUSDT&duration_seconds=60&bar_mode=time&data_length=200&indicators=macd,atr_bands
 ```
 
 ## 指标
@@ -197,6 +199,7 @@ http://127.0.0.1:8050
 - `ATR Bands`
 - `MACD`
 - `SMA 20`
+- `Orderflow GL`
 - `5分钟仿订单流`
 - `SPQRC 信号`
 - `SPQRC 面板`
@@ -232,6 +235,7 @@ Python 编译检查：
 ## 当前边界
 
 - 浏览器端实时推送目前只覆盖 `bitget + time`
+- WebGL pane 已经开始消费真实逐笔成交和盘口快照，但还没有做到完整逐档校验、回放、撤单分析和全量 DOM 引擎
 - 指标仍然依赖后端计算，不是纯前端指标引擎
 - README 不再记录旧架构和迁移背景，后续以当前分支代码为准
 

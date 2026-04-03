@@ -381,7 +381,7 @@ class DuoKongLineIndicator(Indicator):
         name="多空线",
         pane="price",
         description="通达信风格 HULL 多空线，白色主线叠加红绿趋势段，并标注 多 / 空 信号。",
-        enabled_by_default=False,
+        enabled_by_default=True,
         params=[
             {
                 "key": "mode",

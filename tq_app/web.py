@@ -16,9 +16,16 @@ def create_app(service: MarketDataService, project_root: Path) -> Flask:
         static_folder=str(project_root / "static"),
     )
 
+    css_asset = project_root / "static" / "styles.css"
+    js_asset = project_root / "static" / "app.js"
+    asset_versions = {
+        "styles_css": str(int(css_asset.stat().st_mtime)) if css_asset.exists() else "0",
+        "app_js": str(int(js_asset.stat().st_mtime)) if js_asset.exists() else "0",
+    }
+
     @app.get("/")
     def index() -> str:
-        return render_template("index.html")
+        return render_template("index.html", asset_versions=asset_versions)
 
     @app.get("/api/config")
     def api_config() -> Any:

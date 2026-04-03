@@ -28,11 +28,29 @@ const state = {
   wsReconnectTimerId: null,
   wsActiveSignature: "",
   wsConnectingSignature: "",
+  wsLastMessageAt: 0,
+  wsMonitorTimerId: null,
   wsActualToSyntheticTime: new Map(),
   wsSyntheticToActualTime: new Map(),
   wsMaxSyntheticTime: null,
   wsMaxActualTimeMs: null,
   indicatorSyncTimerId: null,
+  orderflowTradeBuckets: new Map(),
+  orderflowBook: { bids: [], asks: [], ts: null },
+  orderflowRecentTradeIds: [],
+  orderflowSeenTradeIds: new Set(),
+  orderflowUi: {
+    rowDensityScale: 1,
+  },
+  terminalToggles: {
+    cluster: true,
+    text: true,
+    candle: true,
+    oi: true,
+    nl: true,
+    ns: true,
+    vwap: true,
+  },
 };
 
 const DEFAULT_VISIBLE_BARS = 120;
@@ -54,6 +72,14 @@ const BITGET_WS_URL = "wss://ws.bitget.com/v2/ws/public";
 const BITGET_WS_RECONNECT_MS = 2000;
 const BITGET_WS_HEARTBEAT_MS = 20000;
 const BITGET_INDICATOR_SYNC_MS = 1200;
+const BITGET_WS_STALE_MS = 15000;
+const ORDERFLOW_MAX_VISIBLE_COLUMNS = 20;
+const ORDERFLOW_TARGET_VISIBLE_ROWS = 18;
+const ORDERFLOW_MIN_ROW_HEIGHT = 18;
+const ORDERFLOW_CELL_MIN_TEXT_WIDTH = 64;
+const ORDERFLOW_DOM_HALF_WIDTH = 34;
+const ORDERFLOW_IMBALANCE_RATIO = 0.72;
+const TERMINAL_TEMPLATE_STORAGE_KEY = "qh_terminal_template_v1";
 
 function paneLabelConfig(paneId) {
   if (paneId === "pseudo_orderflow_5m") {
@@ -340,6 +366,1418 @@ class LineBandPrimitive {
   }
 }
 
+class WebGLOrderflowRenderer {
+  constructor(paneEntry, definition) {
+    this.paneEntry = paneEntry;
+    this.chart = paneEntry.chart;
+    this.container = paneEntry.container;
+    this.definition = definition;
+    this.viewMode = definition.options?.viewMode || "profile";
+    this.profileOpacity = Number(definition.options?.profileOpacity ?? 0.78);
+    this.footprintOpacity = Number(definition.options?.footprintOpacity ?? 0.9);
+    this.lockPriceCenter = definition.options?.lockPriceCenter !== false;
+    this.showText = definition.options?.showText !== false;
+    this.data = [];
+    this.rows = definition.options?.rows || [];
+    this.palette = {
+      positive: "#12b886",
+      negative: "#f03e3e",
+      neutral: "#eadfce",
+      text: "#5f4a35",
+      grid: "rgba(92, 70, 47, 0.12)",
+      background: "rgba(255, 251, 245, 0.92)",
+      ...(definition.options?.palette || {}),
+    };
+    this.leftGutter = 92;
+    this.dpr = window.devicePixelRatio || 1;
+    this.colorCache = new Map();
+
+    this.glCanvas = document.createElement("canvas");
+    this.glCanvas.className = "orderflow-gl-layer";
+    this.labelCanvas = document.createElement("canvas");
+    this.labelCanvas.className = "orderflow-label-layer";
+    this.container.append(this.glCanvas, this.labelCanvas);
+
+    this.gl = this.glCanvas.getContext("webgl", {
+      alpha: true,
+      antialias: true,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: true,
+    });
+    this.labelCtx = this.labelCanvas.getContext("2d");
+    this.program = null;
+    this.positionBuffer = null;
+    this.colorBuffer = null;
+    this.positionLocation = null;
+    this.colorLocation = null;
+    this.vertexCount = 0;
+    this.animationTimerId = null;
+    this.needsRender = true;
+    this.hoveredRowKey = null;
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(this.container);
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.render());
+    this.container.addEventListener("pointermove", (event) => this.handlePointerMove(event));
+    this.container.addEventListener("pointerleave", () => {
+      this.hoveredRowKey = null;
+    });
+    this.container.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });
+
+    if (this.gl) {
+      this.setupProgram();
+    }
+    this.resize();
+    this.startAnimationLoop();
+  }
+
+  setupProgram() {
+    const vertexSource = `
+      attribute vec2 a_position;
+      attribute vec4 a_color;
+      varying vec4 v_color;
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_color = a_color;
+      }
+    `;
+    const fragmentSource = `
+      precision mediump float;
+      varying vec4 v_color;
+      void main() {
+        gl_FragColor = v_color;
+      }
+    `;
+    const vertexShader = this.compileShader(this.gl.VERTEX_SHADER, vertexSource);
+    const fragmentShader = this.compileShader(this.gl.FRAGMENT_SHADER, fragmentSource);
+    if (!vertexShader || !fragmentShader) {
+      return;
+    }
+    this.program = this.gl.createProgram();
+    this.gl.attachShader(this.program, vertexShader);
+    this.gl.attachShader(this.program, fragmentShader);
+    this.gl.linkProgram(this.program);
+    if (!this.gl.getProgramParameter(this.program, this.gl.LINK_STATUS)) {
+      console.error("orderflow gl link failed", this.gl.getProgramInfoLog(this.program));
+      this.program = null;
+      return;
+    }
+    this.positionLocation = this.gl.getAttribLocation(this.program, "a_position");
+    this.colorLocation = this.gl.getAttribLocation(this.program, "a_color");
+    this.positionBuffer = this.gl.createBuffer();
+    this.colorBuffer = this.gl.createBuffer();
+  }
+
+  compileShader(type, source) {
+    const shader = this.gl.createShader(type);
+    this.gl.shaderSource(shader, source);
+    this.gl.compileShader(shader);
+    if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
+      console.error("orderflow gl shader failed", this.gl.getShaderInfoLog(shader));
+      return null;
+    }
+    return shader;
+  }
+
+  setData(data) {
+    this.data = Array.isArray(data) ? data : [];
+    this.requestRender();
+  }
+
+  setDefinitionOptions(options) {
+    this.viewMode = options?.viewMode || "profile";
+    this.profileOpacity = Number(options?.profileOpacity ?? 0.78);
+    this.footprintOpacity = Number(options?.footprintOpacity ?? 0.9);
+    this.lockPriceCenter = options?.lockPriceCenter !== false;
+    this.showText = options?.showText !== false;
+    this.requestRender();
+  }
+
+  setMarketContext(context) {
+    this.marketContext = context || null;
+    this.requestRender();
+  }
+
+  resize() {
+    this.dpr = window.devicePixelRatio || 1;
+    const width = Math.max(this.container.clientWidth, 1);
+    const height = Math.max(this.container.clientHeight, 1);
+    this.glCanvas.width = Math.round(width * this.dpr);
+    this.glCanvas.height = Math.round(height * this.dpr);
+    this.glCanvas.style.width = `${width}px`;
+    this.glCanvas.style.height = `${height}px`;
+    this.labelCanvas.width = Math.round(width * this.dpr);
+    this.labelCanvas.height = Math.round(height * this.dpr);
+    this.labelCanvas.style.width = `${width}px`;
+    this.labelCanvas.style.height = `${height}px`;
+    this.requestRender();
+  }
+
+  destroy() {
+    this.resizeObserver.disconnect();
+    if (this.animationTimerId) {
+      window.clearInterval(this.animationTimerId);
+      this.animationTimerId = null;
+    }
+    this.glCanvas.remove();
+    this.labelCanvas.remove();
+  }
+
+  startAnimationLoop() {
+    this.animationTimerId = window.setInterval(() => {
+      if (this.shouldAnimate()) {
+        this.render();
+      } else if (this.needsRender) {
+        this.render();
+      }
+    }, 250);
+  }
+
+  shouldAnimate() {
+    return this.viewMode === "ladder" || this.viewMode === "overlay";
+  }
+
+  requestRender() {
+    this.needsRender = true;
+  }
+
+  handlePointerMove(event) {
+    if (!this.currentScene?.rows?.length) {
+      return;
+    }
+    const rect = this.container.getBoundingClientRect();
+    const y = event.clientY - rect.top;
+    const row = this.currentScene.rows.find((item) => y >= item.top && y < item.bottom);
+    this.hoveredRowKey = row?.key || null;
+    this.requestRender();
+  }
+
+  handleWheel(event) {
+    event.preventDefault();
+    const nextScale = event.deltaY > 0
+      ? Math.min(2.4, state.orderflowUi.rowDensityScale * 1.08)
+      : Math.max(0.55, state.orderflowUi.rowDensityScale / 1.08);
+    state.orderflowUi.rowDensityScale = nextScale;
+    this.requestRender();
+  }
+
+  render() {
+    this.needsRender = false;
+    this.renderGrid();
+    this.renderLabels();
+  }
+
+  renderGrid() {
+    if (!this.gl || !this.program) {
+      return;
+    }
+    const width = this.container.clientWidth || 1;
+    const height = this.container.clientHeight || 1;
+    this.gl.viewport(0, 0, this.glCanvas.width, this.glCanvas.height);
+    const bg = this.cssColorToRgb(this.palette.background, 0.92);
+    this.gl.clearColor(bg.r, bg.g, bg.b, bg.a);
+    this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+
+    const positions = [];
+    const colors = [];
+    const scene = this.viewMode === "profile"
+      ? this.buildProfileScene(width, height)
+      : this.viewMode === "overlay"
+        ? this.buildOverlayScene(width, height)
+        : this.buildFootprintScene(width, height);
+    if (scene) {
+      (scene.highlightBands || []).forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+      (scene.ladderBands || []).forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+      scene.cells.forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+      (scene.separatorBars || []).forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+      (scene.depthBars || []).forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+      this.currentScene = scene;
+    } else {
+      this.currentScene = this.buildMetricScene(width, height);
+      (this.currentScene?.cells || []).forEach((cell) => {
+        this.pushRect(positions, colors, cell.left, cell.top, cell.right, cell.bottom, width, height, cell.color);
+      });
+    }
+
+    this.vertexCount = positions.length / 2;
+    if (this.vertexCount === 0) {
+      return;
+    }
+
+    this.gl.useProgram(this.program);
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.positionBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, new Float32Array(positions), this.gl.STATIC_DRAW);
+    this.gl.enableVertexAttribArray(this.positionLocation);
+    this.gl.vertexAttribPointer(this.positionLocation, 2, this.gl.FLOAT, false, 0, 0);
+
+    this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this.colorBuffer);
+    this.gl.bufferData(this.gl.ARRAY_BUFFER, new Float32Array(colors), this.gl.STATIC_DRAW);
+    this.gl.enableVertexAttribArray(this.colorLocation);
+    this.gl.vertexAttribPointer(this.colorLocation, 4, this.gl.FLOAT, false, 0, 0);
+    this.gl.drawArrays(this.gl.TRIANGLES, 0, this.vertexCount);
+  }
+
+  renderLabels() {
+    if (!this.showText && this.currentScene?.type === "footprint") {
+      this.renderModeHud(this.container.clientWidth || 1);
+      return;
+    }
+    if (!this.labelCtx) {
+      return;
+    }
+    const width = this.container.clientWidth || 1;
+    const height = this.container.clientHeight || 1;
+    this.labelCtx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.labelCtx.clearRect(0, 0, width, height);
+    if (this.currentScene?.type === "footprint") {
+      this.renderFootprintLabels(width, height, this.currentScene);
+      this.renderModeHud(width);
+      return;
+    }
+    if (this.currentScene?.type === "profile") {
+      this.renderProfileLabels(width, height, this.currentScene);
+      this.renderModeHud(width);
+      return;
+    }
+    this.renderMetricLabels(width, height);
+    this.renderModeHud(width);
+  }
+
+  renderModeHud(width) {
+    const modeLabel = this.viewMode === "overlay" ? "Overlay" : this.viewMode === "ladder" ? "Ladder" : "Profile";
+    const density = state.orderflowUi.rowDensityScale.toFixed(2);
+    const lockText = this.lockPriceCenter ? "Center:Lock" : "Center:Free";
+    const wsStatus = !shouldUseBrowserPush()
+      ? "WS:OFF"
+      : state.wsConnection && state.wsConnection.readyState === WebSocket.OPEN
+        ? (Date.now() - (state.wsLastMessageAt || 0) <= BITGET_WS_STALE_MS ? "WS:LIVE" : "WS:STALE")
+        : "WS:DISC";
+    const hudText = `${modeLabel}  ${lockText}  Dense:${density}  ${wsStatus}`;
+    const x = width - 290;
+    const y = 10;
+    this.labelCtx.fillStyle = "rgba(255, 251, 245, 0.88)";
+    this.labelCtx.fillRect(x, y, 280, 40);
+    this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.16)";
+    this.labelCtx.strokeRect(x, y, 280, 40);
+    this.labelCtx.font = "11px IBM Plex Mono, IBM Plex Sans, PingFang SC, Microsoft YaHei, monospace";
+    this.labelCtx.textBaseline = "middle";
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.86)";
+    this.labelCtx.fillText(hudText, x + 8, y + 12);
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.58)";
+    this.labelCtx.fillText("1 Profile  2 Overlay  3 Ladder  C Lock", x + 8, y + 29);
+  }
+
+  renderProfileLabels(width, height, scene) {
+    const { rows, columns, leftGutter, rightGutter } = scene;
+    this.labelCtx.fillStyle = this.palette.background;
+    this.labelCtx.fillRect(0, 0, leftGutter - 8, height);
+    this.labelCtx.fillRect(width - rightGutter, 0, rightGutter, height);
+    this.labelCtx.font = "11px IBM Plex Mono, IBM Plex Sans, PingFang SC, Microsoft YaHei, monospace";
+    this.labelCtx.textBaseline = "middle";
+    this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.08)";
+
+    rows.forEach((row, rowIndex) => {
+      if (rows.length > 26 && rowIndex % 2 === 1) {
+        return;
+      }
+      this.labelCtx.fillStyle = this.palette.text;
+      this.labelCtx.fillText(row.label, 12, row.centerY);
+      this.labelCtx.beginPath();
+      this.labelCtx.moveTo(0, row.top + 0.5);
+      this.labelCtx.lineTo(width, row.top + 0.5);
+      this.labelCtx.stroke();
+    });
+
+    columns.forEach((column) => {
+      this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.72)";
+      this.labelCtx.fillText(column.label, column.centerX - 18, 12);
+      if (column.pocPriceLabel) {
+        this.labelCtx.fillStyle = "rgba(168, 116, 54, 0.92)";
+        this.labelCtx.fillText(column.pocPriceLabel, column.centerX - 22, height - 12);
+      }
+      if (column.valueAreaLabels) {
+        this.labelCtx.fillStyle = "rgba(57, 100, 176, 0.88)";
+        this.labelCtx.fillText(column.valueAreaLabels.vah, column.centerX - 22, column.valueAreaLabels.vahY);
+        this.labelCtx.fillText(column.valueAreaLabels.val, column.centerX - 22, column.valueAreaLabels.valY);
+      }
+    });
+
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.82)";
+    this.labelCtx.fillText("Price", 12, 12);
+    this.labelCtx.fillText("Profile", width - rightGutter + 8, 12);
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.64)";
+    this.labelCtx.fillText("VRP", width - rightGutter + 56, 12);
+    if (scene.summaryText) {
+      this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.68)";
+      this.labelCtx.fillText(scene.summaryText, width - rightGutter + 8, 28);
+    }
+    if (scene.headerStats) {
+      this.labelCtx.fillStyle = "rgba(225, 229, 236, 0.88)";
+      this.labelCtx.fillText(scene.headerStats.primary, 160, 12);
+      this.labelCtx.fillStyle = "rgba(141, 147, 165, 0.82)";
+      this.labelCtx.fillText(scene.headerStats.secondary, 160, 28);
+    }
+  }
+
+  renderMetricLabels(width, height) {
+    this.labelCtx.fillStyle = this.palette.background;
+    this.labelCtx.fillRect(0, 0, this.leftGutter - 8, height);
+    this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.12)";
+    this.labelCtx.lineWidth = 1;
+    this.labelCtx.beginPath();
+    this.labelCtx.moveTo(this.leftGutter - 0.5, 0);
+    this.labelCtx.lineTo(this.leftGutter - 0.5, height);
+    this.labelCtx.stroke();
+
+    const rowHeight = height / Math.max(this.rows.length, 1);
+    this.labelCtx.font = "12px IBM Plex Sans, PingFang SC, Microsoft YaHei, sans-serif";
+    this.labelCtx.textBaseline = "middle";
+    for (let rowIndex = 0; rowIndex < this.rows.length; rowIndex += 1) {
+      const row = this.rows[rowIndex];
+      const y = rowIndex * rowHeight + rowHeight / 2;
+      this.labelCtx.fillStyle = this.palette.text;
+      this.labelCtx.fillText(row.label, 10, y);
+      const latest = this.latestMetricValue(row.key);
+      this.labelCtx.fillStyle = latest.color;
+      this.labelCtx.fillText(latest.text, this.leftGutter - 48, y);
+      this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.08)";
+      this.labelCtx.beginPath();
+      this.labelCtx.moveTo(0, rowIndex * rowHeight + 0.5);
+      this.labelCtx.lineTo(width, rowIndex * rowHeight + 0.5);
+      this.labelCtx.stroke();
+    }
+  }
+
+  renderFootprintLabels(width, height, scene) {
+    const { rows, columns, rightGutter } = scene;
+    this.labelCtx.fillStyle = this.palette.background;
+    this.labelCtx.fillRect(0, 0, this.leftGutter - 8, height);
+    this.labelCtx.fillRect(width - rightGutter, 0, rightGutter, height);
+    this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.12)";
+    this.labelCtx.lineWidth = 1;
+    this.labelCtx.font = "11px IBM Plex Mono, IBM Plex Sans, PingFang SC, Microsoft YaHei, monospace";
+    this.labelCtx.textBaseline = "middle";
+    const showEveryRow = rows.length <= 22;
+
+    rows.forEach((row, rowIndex) => {
+      if (!showEveryRow && rowIndex % 2 === 1) {
+        return;
+      }
+      this.labelCtx.fillStyle = this.palette.text;
+      this.labelCtx.fillText(row.label, 12, row.centerY);
+      this.labelCtx.strokeStyle = "rgba(92, 70, 47, 0.08)";
+      this.labelCtx.beginPath();
+      this.labelCtx.moveTo(0, row.top + 0.5);
+      this.labelCtx.lineTo(width, row.top + 0.5);
+      this.labelCtx.stroke();
+      if (row.key === this.hoveredRowKey) {
+        this.labelCtx.fillStyle = "rgba(162, 79, 47, 0.08)";
+        this.labelCtx.fillRect(0, row.top, width, row.bottom - row.top);
+      }
+    });
+
+    columns.forEach((column) => {
+      this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.64)";
+      this.labelCtx.fillText(column.label, column.left + 8, 12);
+    });
+
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.82)";
+    this.labelCtx.fillText("Price", 12, 12);
+    this.labelCtx.textAlign = "right";
+    this.labelCtx.fillText("Bid", this.leftGutter + 44, 12);
+    this.labelCtx.textAlign = "left";
+    this.labelCtx.fillText("Ask", this.leftGutter + 52, 12);
+
+    (scene.ladderSeparators || []).forEach((separator) => {
+      this.labelCtx.strokeStyle = separator.color;
+      this.labelCtx.beginPath();
+      this.labelCtx.moveTo(separator.x, separator.top);
+      this.labelCtx.lineTo(separator.x, separator.bottom);
+      this.labelCtx.stroke();
+    });
+
+    scene.textCells.forEach((cell) => {
+      if (cell.width < ORDERFLOW_CELL_MIN_TEXT_WIDTH || cell.height < 16) {
+        return;
+      }
+      const centerY = cell.top + cell.height / 2;
+      this.labelCtx.fillStyle = cell.bidColor;
+      this.labelCtx.textAlign = "right";
+      this.labelCtx.fillText(cell.bidText, cell.left + cell.width * 0.48, centerY);
+      this.labelCtx.fillStyle = "rgba(126, 96, 69, 0.45)";
+      this.labelCtx.fillText("|", cell.left + cell.width * 0.5, centerY);
+      this.labelCtx.fillStyle = cell.askColor;
+      this.labelCtx.textAlign = "left";
+      this.labelCtx.fillText(cell.askText, cell.left + cell.width * 0.52, centerY);
+      if (cell.markerText) {
+        this.labelCtx.fillStyle = cell.markerColor;
+        this.labelCtx.textAlign = "center";
+        this.labelCtx.fillText(cell.markerText, cell.left + cell.width * 0.5, centerY - 10);
+      }
+    });
+    this.labelCtx.textAlign = "left";
+
+    this.labelCtx.fillStyle = this.palette.text;
+    this.labelCtx.fillText("DOM", width - rightGutter + 8, 12);
+    if (scene.summaryText) {
+      this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.7)";
+      this.labelCtx.fillText(scene.summaryText, width - rightGutter + 8, 28);
+    }
+    this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.72)";
+    this.labelCtx.fillText("BidΣ", width - rightGutter + 8, 44);
+    this.labelCtx.fillText("Bid", width - rightGutter + 46, 44);
+    this.labelCtx.fillText("Ask", width - rightGutter + 82, 44);
+    this.labelCtx.fillText("AskΣ", width - rightGutter + 114, 44);
+    scene.depthTexts.forEach((item) => {
+      if (item.rowKey === this.hoveredRowKey) {
+        this.labelCtx.fillStyle = "rgba(162, 79, 47, 0.08)";
+        this.labelCtx.fillRect(width - rightGutter, item.top, rightGutter, item.bottom - item.top);
+      }
+      this.labelCtx.fillStyle = item.bidColor;
+      this.labelCtx.fillText(item.bidCumText, width - rightGutter + 8, item.centerY);
+      this.labelCtx.fillText(item.bidText, width - rightGutter + 46, item.centerY);
+      this.labelCtx.fillStyle = "rgba(95, 74, 53, 0.48)";
+      this.labelCtx.fillText("|", width - rightGutter + 76, item.centerY);
+      this.labelCtx.fillStyle = item.askColor;
+      this.labelCtx.fillText(item.askText, width - rightGutter + 82, item.centerY);
+      this.labelCtx.fillText(item.askCumText, width - rightGutter + 114, item.centerY);
+      if (item.tagText) {
+        this.labelCtx.fillStyle = item.tagColor;
+        this.labelCtx.fillText(item.tagText, width - rightGutter + 8, item.centerY - 10);
+      }
+    });
+  }
+
+  buildMetricScene(width, height) {
+    if (!this.data.length || !this.rows.length) {
+      return null;
+    }
+    const coordinates = this.data.map((point) => this.chart.timeScale().timeToCoordinate(point.time));
+    const rowHeight = height / this.rows.length;
+    const cells = [];
+    for (let columnIndex = 0; columnIndex < this.data.length; columnIndex += 1) {
+      const x = coordinates[columnIndex];
+      if (!Number.isFinite(x)) {
+        continue;
+      }
+      const previousX = columnIndex > 0 ? coordinates[columnIndex - 1] : null;
+      const nextX = columnIndex < coordinates.length - 1 ? coordinates[columnIndex + 1] : null;
+      const left = this.leftGutter + Math.max(0, Number.isFinite(previousX) ? (previousX + x) / 2 : x - this.inferBarWidth(x, nextX));
+      const right = Math.min(width, this.leftGutter + (Number.isFinite(nextX) ? (x + nextX) / 2 : x + this.inferBarWidth(previousX, x)));
+      if (!Number.isFinite(left) || !Number.isFinite(right) || right <= left) {
+        continue;
+      }
+      for (let rowIndex = 0; rowIndex < this.rows.length; rowIndex += 1) {
+        const row = this.rows[rowIndex];
+        const top = rowIndex * rowHeight + 1;
+        const bottom = top + rowHeight - 2;
+        const value = Number(this.data[columnIndex]?.[row.key]);
+        const color = this.metricColor(value, row);
+        cells.push({ left, right, top, bottom, color });
+      }
+    }
+    return { type: "metric", cells };
+  }
+
+  buildFootprintScene(width, height) {
+    const candles = this.marketContext?.candles || [];
+    const tradeBuckets = this.marketContext?.tradeBuckets;
+    if (!candles.length || !(tradeBuckets instanceof Map) || tradeBuckets.size === 0) {
+      return null;
+    }
+
+    const visibleCandles = candles.slice(-Math.min(candles.length, ORDERFLOW_MAX_VISIBLE_COLUMNS));
+    const columns = visibleCandles
+      .map((candle, index) => {
+        const x = this.chart.timeScale().timeToCoordinate(candle.time);
+        if (!Number.isFinite(x)) {
+          return null;
+        }
+        return {
+          time: candle.time,
+          x,
+          label: (this.marketContext?.timeLabels?.get(String(candle.time)) || "").slice(11, 16),
+          index,
+        };
+      })
+      .filter(Boolean);
+    if (columns.length === 0) {
+      return null;
+    }
+
+    const rightGutter = 164;
+    const levelsMap = new Map();
+    visibleCandles.forEach((candle) => {
+      const actualTimeMs = this.marketContext?.syntheticToActualTime?.get(Number(candle.time));
+      const bucket = tradeBuckets.get(String(actualTimeMs));
+      if (!bucket) {
+        return;
+      }
+      bucket.levels.forEach((level, key) => {
+        levelsMap.set(key, level.price);
+      });
+    });
+    [...(this.marketContext?.orderBook?.bids || []), ...(this.marketContext?.orderBook?.asks || [])].forEach((level) => {
+      levelsMap.set(orderflowPriceKey(level.price), level.price);
+    });
+    const sortedLevels = [...levelsMap.values()].sort((a, b) => b - a);
+    const bestBid = Number(this.marketContext?.orderBook?.bids?.[0]?.price);
+    const bestAsk = Number(this.marketContext?.orderBook?.asks?.[0]?.price);
+    const referencePrice = Number.isFinite(bestBid) && Number.isFinite(bestAsk)
+      ? (bestBid + bestAsk) / 2
+      : Number.isFinite(bestBid)
+        ? bestBid
+        : Number.isFinite(bestAsk)
+          ? bestAsk
+          : sortedLevels[Math.floor(sortedLevels.length / 2)];
+    const priceTick = this.derivePriceTick(sortedLevels);
+    let centerIndex = sortedLevels.findIndex((price) => price <= referencePrice);
+    if (centerIndex < 0) {
+      centerIndex = Math.floor(sortedLevels.length / 2);
+    }
+    const visibleRowCount = Math.max(
+      10,
+      Math.min(
+        34,
+        Math.round((Math.floor(height / ORDERFLOW_MIN_ROW_HEIGHT) || ORDERFLOW_TARGET_VISIBLE_ROWS) / state.orderflowUi.rowDensityScale),
+        ORDERFLOW_TARGET_VISIBLE_ROWS + 6
+      )
+    );
+    const anchorIndex = this.lockPriceCenter ? centerIndex : Math.floor(sortedLevels.length / 2);
+    const fixedWindowHalf = Math.floor(visibleRowCount / 2);
+    const startIndex = Math.max(0, Math.min(sortedLevels.length - visibleRowCount, anchorIndex - fixedWindowHalf));
+    const priceLevels = sortedLevels.slice(startIndex, startIndex + visibleRowCount);
+    if (priceLevels.length === 0) {
+      return null;
+    }
+
+    const rowHeight = height / priceLevels.length;
+    const rows = priceLevels.map((price, index) => ({
+      price,
+      key: orderflowPriceKey(price),
+      label: price.toFixed(2),
+      top: index * rowHeight,
+      bottom: index * rowHeight + rowHeight,
+      centerY: index * rowHeight + rowHeight / 2,
+    }));
+
+    const cells = [];
+    const textCells = [];
+    const separatorBars = [];
+    const highlightBands = [];
+    const ladderBands = [];
+    const ladderSeparators = [];
+    const depthBars = [];
+    const depthTexts = [];
+    const allDepthLevels = [...(this.marketContext?.orderBook?.bids || []), ...(this.marketContext?.orderBook?.asks || [])];
+    const maxDepthSize = Math.max(
+      1,
+      ...allDepthLevels.map((item) => item.size || 0)
+    );
+    const bucketTotals = [];
+    visibleCandles.forEach((candle) => {
+      const actualTimeMs = this.marketContext?.syntheticToActualTime?.get(Number(candle.time));
+      const bucket = tradeBuckets.get(String(actualTimeMs));
+      if (!bucket) {
+        return;
+      }
+      bucket.levels.forEach((level) => {
+        const total = Number(level?.total || 0);
+        if (Number.isFinite(total) && total > 0) {
+          bucketTotals.push(total);
+        }
+      });
+    });
+    bucketTotals.sort((a, b) => a - b);
+    const largeTradeThreshold = bucketTotals.length
+      ? bucketTotals[Math.max(0, Math.floor(bucketTotals.length * 0.88) - 1)]
+      : Number.POSITIVE_INFINITY;
+    const pulseAlpha = 0.08 + ((Math.sin(performance.now() / 380) + 1) / 2) * 0.18;
+
+    columns.forEach((column, index) => {
+      const previousX = index > 0 ? columns[index - 1].x : null;
+      const nextX = index < columns.length - 1 ? columns[index + 1].x : null;
+      const left = this.leftGutter + Math.max(0, Number.isFinite(previousX) ? (previousX + column.x) / 2 : column.x - this.inferBarWidth(column.x, nextX));
+      const right = Math.min(width - rightGutter, this.leftGutter + (Number.isFinite(nextX) ? (column.x + nextX) / 2 : column.x + this.inferBarWidth(previousX, column.x)));
+      if (!Number.isFinite(left) || !Number.isFinite(right) || right <= left) {
+        return;
+      }
+      const midX = left + (right - left) / 2;
+      const actualTimeMs = this.marketContext?.syntheticToActualTime?.get(Number(column.time));
+      const bucket = tradeBuckets.get(String(actualTimeMs));
+      const levels = bucket?.levels || new Map();
+      const tradedRows = [];
+
+      rows.forEach((row, rowIndex) => {
+        const level = levels.get(row.key);
+        const buy = Number(level?.buy || 0);
+        const sell = Number(level?.sell || 0);
+        const total = Number(level?.total || 0);
+        if (total <= 0) {
+          return;
+        }
+        tradedRows.push({ row, rowIndex, buy, sell, total });
+        const totalStrength = Math.max(0, Math.min(total / 8, 1));
+        const buyDominance = Math.max(0, Math.min(buy / Math.max(total, 1e-9), 1));
+        const sellDominance = Math.max(0, Math.min(sell / Math.max(total, 1e-9), 1));
+        const sweepBias = Math.abs(buy - sell) >= Math.max(8, total * 0.66);
+        const nextLowerRow = rows[rowIndex + 1];
+        const nextHigherRow = rows[rowIndex - 1];
+        const nextLowerLevel = nextLowerRow ? levels.get(nextLowerRow.key) : null;
+        const nextHigherLevel = nextHigherRow ? levels.get(nextHigherRow.key) : null;
+        const stackedAsk = sell > 0 && Number(nextLowerLevel?.buy || 0) > 0 && sell >= Number(nextLowerLevel.buy) * 2.5;
+        const stackedBid = buy > 0 && Number(nextHigherLevel?.sell || 0) > 0 && buy >= Number(nextHigherLevel.sell) * 2.5;
+        const buyColor = this.mixColors(this.palette.neutral, this.palette.positive, buyDominance, (0.14 + totalStrength * 0.74) * this.footprintOpacity);
+        const sellColor = this.mixColors(this.palette.neutral, this.palette.negative, sellDominance, (0.14 + totalStrength * 0.74) * this.footprintOpacity);
+        cells.push({
+          left,
+          right: midX,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: buyColor,
+        });
+        cells.push({
+          left: midX,
+          right,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: sellColor,
+        });
+        separatorBars.push({
+          left: midX - 0.5,
+          right: midX + 0.5,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: this.cssColorToRgb("rgba(126, 96, 69, 0.28)", 0.35),
+        });
+        textCells.push({
+          left,
+          top: row.top + 1,
+          width: right - left,
+          height: row.bottom - row.top - 2,
+          bidText: buy > 0 ? buy.toFixed(buy >= 10 ? 0 : 1) : "",
+          askText: sell > 0 ? sell.toFixed(sell >= 10 ? 0 : 1) : "",
+          bidColor: buy > sell ? "rgba(7, 101, 73, 0.95)" : "rgba(7, 101, 73, 0.78)",
+          askColor: sell > buy ? "rgba(155, 30, 30, 0.95)" : "rgba(155, 30, 30, 0.78)",
+          markerText: total >= largeTradeThreshold
+            ? "BLK"
+            : stackedAsk
+              ? "STA"
+              : stackedBid
+                ? "STB"
+            : sweepBias
+              ? (buy > sell ? "SWP↑" : "SWP↓")
+              : (buyDominance >= ORDERFLOW_IMBALANCE_RATIO ? "B↑" : (sellDominance >= ORDERFLOW_IMBALANCE_RATIO ? "S↓" : "")),
+          markerColor: total >= largeTradeThreshold
+            ? "rgba(168, 116, 54, 0.98)"
+            : stackedAsk
+              ? "rgba(155, 30, 30, 0.98)"
+              : stackedBid
+                ? "rgba(7, 101, 73, 0.98)"
+            : sweepBias
+              ? (buy > sell ? "rgba(7, 101, 73, 0.98)" : "rgba(155, 30, 30, 0.98)")
+            : buyDominance >= ORDERFLOW_IMBALANCE_RATIO
+              ? "rgba(7, 101, 73, 0.98)"
+              : "rgba(155, 30, 30, 0.98)",
+        });
+      });
+
+      if (tradedRows.length > 0) {
+        const topTrade = tradedRows[0];
+        const bottomTrade = tradedRows[tradedRows.length - 1];
+        const topUnfinished = topTrade.buy > 0 && topTrade.sell > 0;
+        const bottomUnfinished = bottomTrade.buy > 0 && bottomTrade.sell > 0;
+        textCells.push({
+          left,
+          top: topTrade.row.top + 1,
+          width: right - left,
+          height: topTrade.row.bottom - topTrade.row.top - 2,
+          bidText: "",
+          askText: "",
+          bidColor: "rgba(7, 101, 73, 0.9)",
+          askColor: "rgba(155, 30, 30, 0.9)",
+          markerText: topUnfinished ? "UA↑" : "EXH↑",
+          markerColor: topUnfinished ? "rgba(168, 116, 54, 0.98)" : "rgba(155, 30, 30, 0.92)",
+        });
+        if (bottomTrade.row.key !== topTrade.row.key) {
+          textCells.push({
+            left,
+            top: bottomTrade.row.top + 1,
+            width: right - left,
+            height: bottomTrade.row.bottom - bottomTrade.row.top - 2,
+            bidText: "",
+            askText: "",
+            bidColor: "rgba(7, 101, 73, 0.9)",
+            askColor: "rgba(155, 30, 30, 0.9)",
+            markerText: bottomUnfinished ? "UA↓" : "EXH↓",
+            markerColor: bottomUnfinished ? "rgba(168, 116, 54, 0.98)" : "rgba(7, 101, 73, 0.92)",
+          });
+        }
+      }
+    });
+
+    let cumulativeBid = 0;
+    let cumulativeAsk = 0;
+    const ladderLeft = width - rightGutter;
+    [36, 74, 110, 146].forEach((offset) => {
+      ladderSeparators.push({
+        x: ladderLeft + offset,
+        top: 36,
+        bottom: height,
+        color: "rgba(92, 70, 47, 0.12)",
+      });
+    });
+    rows.forEach((row, rowIndex) => {
+      const bid = (this.marketContext?.orderBook?.bids || []).find((item) => orderflowPriceKey(item.price) === row.key);
+      const ask = (this.marketContext?.orderBook?.asks || []).find((item) => orderflowPriceKey(item.price) === row.key);
+      const nextLowerRow = rows[rowIndex + 1];
+      const nextBid = nextLowerRow
+        ? (this.marketContext?.orderBook?.bids || []).find((item) => orderflowPriceKey(item.price) === nextLowerRow.key)
+        : null;
+      const domHalfWidth = ORDERFLOW_DOM_HALF_WIDTH;
+      const bidWidth = bid ? (domHalfWidth * (bid.size / maxDepthSize)) : 0;
+      const askWidth = ask ? (domHalfWidth * (ask.size / maxDepthSize)) : 0;
+      const domMid = width - rightGutter + 56;
+      ladderBands.push({
+        left: width - rightGutter,
+        right: width,
+        top: row.top,
+        bottom: row.bottom,
+        color: this.cssColorToRgb(rowIndex % 2 === 0 ? "rgba(92, 70, 47, 0.025)" : "rgba(92, 70, 47, 0.055)", 1),
+      });
+      if (bidWidth > 0) {
+        depthBars.push({
+          left: domMid - bidWidth,
+          right: domMid,
+          top: row.top + 2,
+          bottom: row.bottom - 2,
+          color: this.mixColors(this.palette.neutral, this.palette.positive, 0.85, 0.45 * this.footprintOpacity),
+        });
+      }
+      if (askWidth > 0) {
+        depthBars.push({
+          left: domMid,
+          right: domMid + askWidth,
+          top: row.top + 2,
+          bottom: row.bottom - 2,
+          color: this.mixColors(this.palette.neutral, this.palette.negative, 0.85, 0.45 * this.footprintOpacity),
+        });
+      }
+      cumulativeBid += bid ? bid.size : 0;
+      cumulativeAsk += ask ? ask.size : 0;
+      const bidSize = bid ? bid.size : 0;
+      const askSize = ask ? ask.size : 0;
+      const totalDepth = bidSize + askSize;
+      const bidRatio = totalDepth > 0 ? bidSize / totalDepth : 0;
+      const askRatio = totalDepth > 0 ? askSize / totalDepth : 0;
+      const stackedAskImbalance = ask && nextBid && ask.size >= nextBid.size * 2.5 && ask.size >= 5;
+      const stackedBidImbalance = bid && nextLowerRow
+        ? (() => {
+            const upperAsk = ask;
+            return bid && upperAsk && bid.size >= upperAsk.size * 2.5 && bid.size >= 5;
+          })()
+        : false;
+      depthTexts.push({
+        centerY: row.centerY,
+        top: row.top,
+        bottom: row.bottom,
+        rowKey: row.key,
+        bidColor: bid ? "rgba(7, 101, 73, 0.96)" : "rgba(95, 74, 53, 0.30)",
+        askColor: ask ? "rgba(155, 30, 30, 0.96)" : "rgba(95, 74, 53, 0.30)",
+        bidCumText: bid ? cumulativeBid.toFixed(cumulativeBid >= 10 ? 0 : 1) : "-",
+        askCumText: ask ? cumulativeAsk.toFixed(cumulativeAsk >= 10 ? 0 : 1) : "-",
+        bidText: bid ? bid.size.toFixed(bid.size >= 10 ? 0 : 1) : "-",
+        askText: ask ? ask.size.toFixed(ask.size >= 10 ? 0 : 1) : "-",
+        tagText: stackedAskImbalance ? "STACK A" : (stackedBidImbalance ? "STACK B" : (bidRatio >= ORDERFLOW_IMBALANCE_RATIO ? "BID IMB" : (askRatio >= ORDERFLOW_IMBALANCE_RATIO ? "ASK IMB" : ""))),
+        tagColor: stackedAskImbalance
+          ? "rgba(155, 30, 30, 0.98)"
+          : stackedBidImbalance
+            ? "rgba(7, 101, 73, 0.98)"
+            : bidRatio >= ORDERFLOW_IMBALANCE_RATIO
+              ? "rgba(7, 101, 73, 0.96)"
+              : "rgba(155, 30, 30, 0.96)",
+      });
+
+      const nearBestBid = Number.isFinite(bestBid) && Math.abs(row.price - bestBid) <= priceTick * 0.25;
+      const nearBestAsk = Number.isFinite(bestAsk) && Math.abs(row.price - bestAsk) <= priceTick * 0.25;
+      const nearMid = Number.isFinite(referencePrice) && Math.abs(row.price - referencePrice) <= priceTick * 0.25;
+      if (nearBestBid) {
+        highlightBands.push({
+          left: this.leftGutter,
+          right: width,
+          top: row.top,
+          bottom: row.bottom,
+          color: this.cssColorToRgb("rgba(18, 184, 134, 1)", pulseAlpha),
+        });
+      }
+      if (nearBestAsk) {
+        highlightBands.push({
+          left: this.leftGutter,
+          right: width,
+          top: row.top,
+          bottom: row.bottom,
+          color: this.cssColorToRgb("rgba(240, 62, 62, 1)", pulseAlpha),
+        });
+      }
+      if (nearMid) {
+        highlightBands.push({
+          left: this.leftGutter,
+          right: width,
+          top: row.centerY - 1,
+          bottom: row.centerY + 1,
+          color: this.cssColorToRgb("rgba(168, 116, 54, 0.30)", 0.3),
+        });
+      }
+    });
+
+    const spreadTicks = Number.isFinite(bestBid) && Number.isFinite(bestAsk) && priceTick > 0
+      ? ((bestAsk - bestBid) / priceTick).toFixed(1)
+      : "--";
+
+    return {
+      type: "footprint",
+      rows,
+      columns,
+      cells,
+      textCells,
+      separatorBars,
+      highlightBands,
+      ladderBands,
+      ladderSeparators,
+      depthBars,
+      depthTexts,
+      rightGutter,
+      summaryText: `Spr ${spreadTicks}t  Mid ${Number.isFinite(referencePrice) ? referencePrice.toFixed(2) : "--"}`,
+    };
+  }
+
+  buildProfileScene(width, height) {
+    const candles = this.marketContext?.candles || [];
+    const tradeBuckets = this.marketContext?.tradeBuckets;
+    if (!candles.length || !(tradeBuckets instanceof Map) || tradeBuckets.size === 0) {
+      return null;
+    }
+
+    const leftGutter = 72;
+    const rightGutter = 132;
+    const visibleCandles = candles.slice(-Math.min(candles.length, ORDERFLOW_MAX_VISIBLE_COLUMNS));
+    const levelsMap = new Map();
+    const columns = visibleCandles
+      .map((candle, index) => {
+        const x = this.chart.timeScale().timeToCoordinate(candle.time);
+        if (!Number.isFinite(x)) {
+          return null;
+        }
+        const actualTimeMs = this.marketContext?.syntheticToActualTime?.get(Number(candle.time));
+        const bucket = tradeBuckets.get(String(actualTimeMs));
+        if (!bucket) {
+          return null;
+        }
+        bucket.levels.forEach((level, key) => {
+          levelsMap.set(key, level.price);
+        });
+        return {
+          time: candle.time,
+          x,
+          label: (this.marketContext?.timeLabels?.get(String(candle.time)) || "").slice(11, 16),
+          actualTimeMs,
+          bucket,
+          index,
+        };
+      })
+      .filter(Boolean);
+    if (columns.length === 0) {
+      return null;
+    }
+
+    const sortedLevels = [...levelsMap.values()].sort((a, b) => b - a);
+    if (sortedLevels.length === 0) {
+      return null;
+    }
+    const priceTick = this.derivePriceTick(sortedLevels);
+    const bestBid = Number(this.marketContext?.orderBook?.bids?.[0]?.price);
+    const bestAsk = Number(this.marketContext?.orderBook?.asks?.[0]?.price);
+    const referencePrice = Number.isFinite(bestBid) && Number.isFinite(bestAsk)
+      ? (bestBid + bestAsk) / 2
+      : sortedLevels[Math.floor(sortedLevels.length / 2)];
+    let centerIndex = sortedLevels.findIndex((price) => price <= referencePrice);
+    if (centerIndex < 0) {
+      centerIndex = Math.floor(sortedLevels.length / 2);
+    }
+    const visibleRowCount = Math.max(
+      10,
+      Math.min(
+        36,
+        Math.round((Math.floor(height / ORDERFLOW_MIN_ROW_HEIGHT) || ORDERFLOW_TARGET_VISIBLE_ROWS) / state.orderflowUi.rowDensityScale),
+        ORDERFLOW_TARGET_VISIBLE_ROWS + 8
+      )
+    );
+    const anchorIndex = this.lockPriceCenter ? centerIndex : Math.floor(sortedLevels.length / 2);
+    const startIndex = Math.max(0, Math.min(sortedLevels.length - visibleRowCount, anchorIndex - Math.floor(visibleRowCount / 2)));
+    const priceLevels = sortedLevels.slice(startIndex, startIndex + visibleRowCount);
+    const rowHeight = height / priceLevels.length;
+    const rows = priceLevels.map((price, index) => ({
+      price,
+      key: orderflowPriceKey(price),
+      label: price.toFixed(2),
+      top: index * rowHeight,
+      bottom: index * rowHeight + rowHeight,
+      centerY: index * rowHeight + rowHeight / 2,
+    }));
+
+    const cells = [];
+    const separatorBars = [];
+    const highlightBands = [];
+    const depthBars = [];
+    const maxColumnWidth = 28;
+    const visibleProfileLevels = new Map();
+
+    columns.forEach((column, index) => {
+      const previousX = index > 0 ? columns[index - 1].x : null;
+      const nextX = index < columns.length - 1 ? columns[index + 1].x : null;
+      const centerX = leftGutter + column.x;
+      const columnWidth = Math.max(14, Math.min(38, Number.isFinite(previousX) && Number.isFinite(nextX) ? (nextX - previousX) * 0.7 : 24));
+      const levels = column.bucket.levels || new Map();
+      let maxTotal = 0;
+      let pocPrice = null;
+      let pocTotal = -1;
+      rows.forEach((row) => {
+        const level = levels.get(row.key);
+        const total = Number(level?.total || 0);
+        if (total > maxTotal) {
+          maxTotal = total;
+        }
+        if (total > pocTotal) {
+          pocTotal = total;
+          pocPrice = row.price;
+        }
+      });
+      const valueAreaTarget = [...levels.values()].reduce((sum, level) => sum + Number(level?.total || 0), 0) * 0.7;
+      const ranked = rows
+        .map((row) => ({ row, total: Number(levels.get(row.key)?.total || 0) }))
+        .filter((item) => item.total > 0)
+        .sort((a, b) => b.total - a.total);
+      let valueAreaAccum = 0;
+      const valueAreaKeys = new Set();
+      ranked.forEach((item) => {
+        if (valueAreaAccum < valueAreaTarget) {
+          valueAreaAccum += item.total;
+          valueAreaKeys.add(item.row.key);
+        }
+      });
+
+      let vahRow = null;
+      let valRow = null;
+      rows.forEach((row) => {
+        const level = levels.get(row.key);
+        const buy = Number(level?.buy || 0);
+        const sell = Number(level?.sell || 0);
+        const total = Number(level?.total || 0);
+        if (total <= 0 || maxTotal <= 0) {
+          return;
+        }
+        const aggregate = visibleProfileLevels.get(row.key) || { buy: 0, sell: 0, total: 0 };
+        aggregate.buy += buy;
+        aggregate.sell += sell;
+        aggregate.total += total;
+        visibleProfileLevels.set(row.key, aggregate);
+        const leftWidth = (Math.min(sell / maxTotal, 1) * maxColumnWidth);
+        const rightWidth = (Math.min(buy / maxTotal, 1) * maxColumnWidth);
+        const delta = buy - sell;
+        const deltaWidth = Math.min(Math.abs(delta) / maxTotal, 1) * (maxColumnWidth * 0.68);
+        const left = centerX - leftWidth;
+        const right = centerX + rightWidth;
+        const rowCenterX = centerX;
+        const buyColor = this.mixColors("#1b1c21", "#6f8ecf", Math.min(buy / Math.max(total, 1e-9), 1), (0.32 + Math.min(total / Math.max(maxTotal, 1), 1) * 0.58) * this.profileOpacity);
+        const sellColor = this.mixColors("#1b1c21", "#d53847", Math.min(sell / Math.max(total, 1e-9), 1), (0.32 + Math.min(total / Math.max(maxTotal, 1), 1) * 0.58) * this.profileOpacity);
+        cells.push({
+          left,
+          right: rowCenterX,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: sellColor,
+        });
+        cells.push({
+          left: rowCenterX,
+          right,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: buyColor,
+        });
+        cells.push({
+          left: delta >= 0 ? rowCenterX - 1.5 : rowCenterX - deltaWidth,
+          right: delta >= 0 ? rowCenterX + deltaWidth : rowCenterX + 1.5,
+          top: row.centerY - 1.4,
+          bottom: row.centerY + 1.4,
+          color: this.cssColorToRgb(delta >= 0 ? "rgba(70, 220, 160, 0.92)" : "rgba(255, 96, 96, 0.92)", 0.92 * this.profileOpacity),
+        });
+        separatorBars.push({
+          left: rowCenterX - 0.5,
+          right: rowCenterX + 0.5,
+          top: row.top + 1,
+          bottom: row.bottom - 1,
+          color: this.cssColorToRgb("rgba(185, 202, 240, 0.18)", 0.18),
+        });
+        if (valueAreaKeys.has(row.key)) {
+          highlightBands.push({
+            left: centerX - maxColumnWidth - 2,
+            right: centerX + maxColumnWidth + 2,
+            top: row.top + 2,
+            bottom: row.bottom - 2,
+            color: this.cssColorToRgb("rgba(111, 142, 207, 0.07)", 0.07 * this.profileOpacity),
+          });
+          vahRow = vahRow || row;
+          valRow = row;
+        }
+      });
+
+      if (Number.isFinite(pocPrice)) {
+        const pocRow = rows.find((row) => Math.abs(row.price - pocPrice) <= priceTick * 0.25);
+        if (pocRow) {
+          highlightBands.push({
+            left: centerX - maxColumnWidth - 3,
+            right: centerX + maxColumnWidth + 3,
+            top: pocRow.centerY - 1.5,
+            bottom: pocRow.centerY + 1.5,
+            color: this.cssColorToRgb("rgba(255, 80, 80, 0.75)", 0.75 * this.profileOpacity),
+          });
+          column.pocPriceLabel = pocPrice.toFixed(2);
+        }
+      }
+
+      if (vahRow && valRow) {
+        highlightBands.push({
+          left: centerX - maxColumnWidth - 5,
+          right: centerX + maxColumnWidth + 5,
+          top: vahRow.centerY - 1,
+          bottom: vahRow.centerY + 1,
+          color: this.cssColorToRgb("rgba(57, 100, 176, 0.92)", 0.92 * this.profileOpacity),
+        });
+        highlightBands.push({
+          left: centerX - maxColumnWidth - 5,
+          right: centerX + maxColumnWidth + 5,
+          top: valRow.centerY - 1,
+          bottom: valRow.centerY + 1,
+          color: this.cssColorToRgb("rgba(57, 100, 176, 0.92)", 0.92 * this.profileOpacity),
+        });
+        column.valueAreaLabels = {
+          vah: vahRow.price.toFixed(2),
+          val: valRow.price.toFixed(2),
+          vahY: Math.max(22, vahRow.centerY),
+          valY: Math.min(height - 22, valRow.centerY),
+        };
+      }
+
+      column.centerX = centerX;
+    });
+
+    const spreadTicks = Number.isFinite(bestBid) && Number.isFinite(bestAsk) && priceTick > 0
+      ? ((bestAsk - bestBid) / priceTick).toFixed(1)
+      : "--";
+    const visibleVolume = [...visibleProfileLevels.values()].reduce((sum, item) => sum + Number(item.total || 0), 0);
+    const visibleDelta = [...visibleProfileLevels.values()].reduce((sum, item) => sum + Number(item.buy || 0) - Number(item.sell || 0), 0);
+    const visibleCvd = [...visibleProfileLevels.values()].reduce((sum, item) => sum + (Number(item.buy || 0) - Number(item.sell || 0)), 0);
+    const bestColumn = columns.find((column) => column.pocPriceLabel) || columns[columns.length - 1];
+    const vah = bestColumn?.valueAreaLabels?.vah || "--";
+    const val = bestColumn?.valueAreaLabels?.val || "--";
+
+    const aggregateMax = Math.max(1, ...[...visibleProfileLevels.values()].map((item) => item.total || 0));
+    rows.forEach((row) => {
+      const aggregate = visibleProfileLevels.get(row.key);
+      if (!aggregate || aggregate.total <= 0) {
+        return;
+      }
+      const profileCenter = width - rightGutter + 54;
+      const halfWidth = 26;
+      const askWidth = Math.min(aggregate.sell / aggregateMax, 1) * halfWidth;
+      const bidWidth = Math.min(aggregate.buy / aggregateMax, 1) * halfWidth;
+      depthBars.push({
+        left: profileCenter - askWidth,
+        right: profileCenter,
+        top: row.top + 2,
+        bottom: row.bottom - 2,
+        color: this.cssColorToRgb("rgba(213, 56, 71, 0.55)", 0.55 * this.profileOpacity),
+      });
+      depthBars.push({
+        left: profileCenter,
+        right: profileCenter + bidWidth,
+        top: row.top + 2,
+        bottom: row.bottom - 2,
+        color: this.cssColorToRgb("rgba(111, 142, 207, 0.55)", 0.55 * this.profileOpacity),
+      });
+    });
+
+    return {
+      type: "profile",
+      rows,
+      columns,
+      cells,
+      separatorBars,
+      highlightBands,
+      ladderBands: [],
+      depthBars,
+      leftGutter,
+      rightGutter,
+      summaryText: `VRP  Spr ${spreadTicks}t  Vol ${Math.round(visibleVolume)}`,
+      headerStats: {
+        primary: `POC ${bestColumn?.pocPriceLabel || "--"}   VAH ${vah}   VAL ${val}`,
+        secondary: `Delta ${visibleDelta.toFixed(2)}   CVD ${visibleCvd.toFixed(2)}   Clusters ${columns.length}   VRP active`,
+      },
+    };
+  }
+
+  buildOverlayScene(width, height) {
+    const profileScene = this.buildProfileScene(width, height);
+    const footprintScene = this.buildFootprintScene(width, height);
+    if (!profileScene && !footprintScene) {
+      return null;
+    }
+    if (!profileScene) {
+      return footprintScene;
+    }
+    if (!footprintScene) {
+      return profileScene;
+    }
+    return {
+      ...footprintScene,
+      type: "footprint",
+      cells: [
+        ...profileScene.cells,
+        ...footprintScene.cells,
+      ],
+      separatorBars: [
+        ...(profileScene.separatorBars || []),
+        ...(footprintScene.separatorBars || []),
+      ],
+      highlightBands: [...(profileScene.highlightBands || []), ...(footprintScene.highlightBands || [])],
+      summaryText: `${profileScene.summaryText}  + Overlay`,
+    };
+  }
+
+  derivePriceTick(sortedLevels) {
+    for (let index = 1; index < sortedLevels.length; index += 1) {
+      const diff = Math.abs(sortedLevels[index - 1] - sortedLevels[index]);
+      if (Number.isFinite(diff) && diff > 0) {
+        return diff;
+      }
+    }
+    return 0.01;
+  }
+
+  latestMetricValue(key) {
+    const latest = [...this.data].reverse().find((item) => Number.isFinite(Number(item?.[key])));
+    const value = Number(latest?.[key]);
+    if (!Number.isFinite(value)) {
+      return { text: "--", color: this.palette.text };
+    }
+    return {
+      text: Math.abs(value) >= 100 ? value.toFixed(0) : Math.abs(value) >= 10 ? value.toFixed(1) : value.toFixed(3),
+      color: value >= 0 ? this.palette.positive : this.palette.negative,
+    };
+  }
+
+  inferBarWidth(leftX, rightX) {
+    if (Number.isFinite(leftX) && Number.isFinite(rightX)) {
+      return Math.max(Math.abs(rightX - leftX) / 2, 3);
+    }
+    return 6;
+  }
+
+  metricColor(value, row) {
+    if (!Number.isFinite(value)) {
+      return this.cssColorToRgb(this.palette.neutral, 0.08);
+    }
+    const scale = Number(row.scale) || 1;
+    const strength = Math.max(0, Math.min(Math.abs(value) / scale, 1));
+    if (row.mode === "positive") {
+      return this.mixColors(this.palette.neutral, this.palette.positive, strength, 0.18 + strength * 0.76);
+    }
+    if (value >= 0) {
+      return this.mixColors(this.palette.neutral, this.palette.positive, strength, 0.22 + strength * 0.72);
+    }
+    return this.mixColors(this.palette.neutral, this.palette.negative, strength, 0.22 + strength * 0.72);
+  }
+
+  mixColors(fromCss, toCss, weight, alpha) {
+    const from = this.cssColorToRgb(fromCss, 1);
+    const to = this.cssColorToRgb(toCss, 1);
+    return {
+      r: from.r * (1 - weight) + to.r * weight,
+      g: from.g * (1 - weight) + to.g * weight,
+      b: from.b * (1 - weight) + to.b * weight,
+      a: alpha,
+    };
+  }
+
+  cssColorToRgb(cssColor, alpha = 1) {
+    let normalized = this.colorCache.get(cssColor);
+    if (!normalized) {
+      const ctx = document.createElement("canvas").getContext("2d");
+      ctx.fillStyle = cssColor;
+      normalized = ctx.fillStyle;
+      this.colorCache.set(cssColor, normalized);
+    }
+    const match = normalized.match(/^#([0-9a-f]{6})$/i);
+    if (match) {
+      const hex = match[1];
+      return {
+        r: parseInt(hex.slice(0, 2), 16) / 255,
+        g: parseInt(hex.slice(2, 4), 16) / 255,
+        b: parseInt(hex.slice(4, 6), 16) / 255,
+        a: alpha,
+      };
+    }
+    const rgbaMatch = normalized.match(/^rgba?\(([^)]+)\)$/i);
+    if (rgbaMatch) {
+      const parts = rgbaMatch[1].split(",").map((item) => item.trim());
+      const red = Math.max(0, Math.min(255, Number(parts[0] || 0))) / 255;
+      const green = Math.max(0, Math.min(255, Number(parts[1] || 0))) / 255;
+      const blue = Math.max(0, Math.min(255, Number(parts[2] || 0))) / 255;
+      const parsedAlpha = parts.length > 3 ? Number(parts[3]) : 1;
+      return {
+        r: red,
+        g: green,
+        b: blue,
+        a: Number.isFinite(parsedAlpha) ? parsedAlpha * alpha : alpha,
+      };
+    }
+    return { r: 0.9, g: 0.88, b: 0.82, a: alpha };
+  }
+
+  pushRect(positions, colors, left, top, right, bottom, width, height, color) {
+    const x0 = (left / width) * 2 - 1;
+    const x1 = (right / width) * 2 - 1;
+    const y0 = 1 - (top / height) * 2;
+    const y1 = 1 - (bottom / height) * 2;
+    positions.push(
+      x0, y0,
+      x1, y0,
+      x0, y1,
+      x0, y1,
+      x1, y0,
+      x1, y1
+    );
+    for (let index = 0; index < 6; index += 1) {
+      colors.push(color.r, color.g, color.b, color.a);
+    }
+  }
+}
+
+class TerminalStatsRenderer {
+  constructor(paneEntry, definition) {
+    this.container = paneEntry.container;
+    this.chart = paneEntry.chart;
+    this.definition = definition;
+    this.data = [];
+    this.canvas = document.createElement("canvas");
+    this.canvas.className = "orderflow-label-layer";
+    this.container.append(this.canvas);
+    this.ctx = this.canvas.getContext("2d");
+    this.dpr = window.devicePixelRatio || 1;
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(this.container);
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.render());
+    this.resize();
+  }
+
+  setData(data) {
+    this.data = Array.isArray(data) ? data : [];
+    this.render();
+  }
+
+  setDefinitionOptions(options) {
+    this.definition = { ...this.definition, options };
+    this.render();
+  }
+
+  resize() {
+    this.dpr = window.devicePixelRatio || 1;
+    const width = Math.max(this.container.clientWidth, 1);
+    const height = Math.max(this.container.clientHeight, 1);
+    this.canvas.width = Math.round(width * this.dpr);
+    this.canvas.height = Math.round(height * this.dpr);
+    this.canvas.style.width = `${width}px`;
+    this.canvas.style.height = `${height}px`;
+    this.render();
+  }
+
+  destroy() {
+    this.resizeObserver.disconnect();
+    this.canvas.remove();
+  }
+
+  render() {
+    if (!this.ctx) {
+      return;
+    }
+    const width = this.container.clientWidth || 1;
+    const height = this.container.clientHeight || 1;
+    const rows = this.definition.options?.rows || [];
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.ctx.clearRect(0, 0, width, height);
+    this.ctx.fillStyle = "rgba(16, 17, 22, 0.96)";
+    this.ctx.fillRect(0, 0, width, height);
+    if (!rows.length || !this.data.length) {
+      return;
+    }
+    const headerHeight = 16;
+    const rowHeight = (height - headerHeight) / rows.length;
+    const latestTime = this.data[this.data.length - 1]?.time;
+    this.ctx.font = "11px IBM Plex Mono, IBM Plex Sans, monospace";
+    this.ctx.fillStyle = "rgba(141, 147, 165, 0.82)";
+    this.ctx.fillText("Footprint bar statistics", 8, 11);
+    rows.forEach((row, rowIndex) => {
+      const top = headerHeight + rowIndex * rowHeight;
+      this.ctx.fillStyle = rowIndex % 2 === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.05)";
+      this.ctx.fillRect(0, top, width, rowHeight);
+      this.ctx.fillStyle = "rgba(255,255,255,0.06)";
+      this.ctx.fillRect(0, top, width, 1);
+      this.ctx.fillStyle = "rgba(141, 147, 165, 0.92)";
+      this.ctx.font = "11px IBM Plex Mono, IBM Plex Sans, monospace";
+      this.ctx.fillStyle = row.color || "rgba(141, 147, 165, 0.92)";
+      this.ctx.fillText(row.label, 8, top + 14);
+    });
+    this.data.forEach((point) => {
+      const x = this.chart.timeScale().timeToCoordinate(point.time);
+      if (!Number.isFinite(x)) {
+        return;
+      }
+      const nextX = this.chart.timeScale().timeToCoordinate(point.time + 1);
+      const columnWidth = Number.isFinite(nextX) ? Math.max(nextX - x - 1, 6) : 16;
+      rows.forEach((row, rowIndex) => {
+        const value = Number(point[row.key] || 0);
+        const top = headerHeight + rowIndex * rowHeight + 2;
+        const color = row.color || (value >= 0 ? "rgba(111, 142, 207, 0.85)" : "rgba(213, 56, 71, 0.85)");
+        const alpha = Math.min(Math.abs(value) / (row.scale || 1), 1);
+        this.ctx.fillStyle = color.replace("0.85", String(0.18 + alpha * 0.67));
+        this.ctx.fillRect(x - columnWidth / 2, top, columnWidth, rowHeight - 4);
+        this.ctx.fillStyle = "rgba(236,240,245,0.88)";
+        this.ctx.fillText(row.format ? row.format(value) : `${value}`, x - columnWidth / 2 + 3, top + rowHeight / 2 + 3);
+        if (point.time === latestTime) {
+          this.ctx.strokeStyle = "rgba(255,255,255,0.18)";
+          this.ctx.strokeRect(x - columnWidth / 2, top, columnWidth, rowHeight - 4);
+        }
+      });
+    });
+    rows.forEach((row, rowIndex) => {
+      const latestValue = Number(this.data[this.data.length - 1]?.[row.key] || 0);
+      const top = headerHeight + rowIndex * rowHeight;
+      this.ctx.fillStyle = row.color || "rgba(236,240,245,0.92)";
+      this.ctx.fillText(row.format ? row.format(latestValue) : String(latestValue), width - 72, top + 14);
+    });
+  }
+}
+
 const els = {
   title: document.getElementById("page-title"),
   provider: document.getElementById("provider-name"),
@@ -383,6 +1821,25 @@ const els = {
   spqrcAdvice: document.getElementById("spqrc-advice"),
   indicatorForm: document.getElementById("indicator-form"),
   chartStack: document.getElementById("chart-stack"),
+  toolbarProvider: document.getElementById("toolbar-provider"),
+  toolbarSymbol: document.getElementById("toolbar-symbol"),
+  toolbarDuration: document.getElementById("toolbar-duration"),
+  toolbarBarMode: document.getElementById("toolbar-bar-mode"),
+  toolbarRangeTicks: document.getElementById("toolbar-range-ticks"),
+  toolbarBrickLength: document.getElementById("toolbar-brick-length"),
+  toolbarOrderflowView: document.getElementById("toolbar-orderflow-view"),
+  toolbarCenterLock: document.getElementById("toolbar-center-lock"),
+  toggleCluster: document.getElementById("toggle-cluster"),
+  toggleText: document.getElementById("toggle-text"),
+  toggleCandle: document.getElementById("toggle-candle"),
+  toggleOi: document.getElementById("toggle-oi"),
+  toggleNl: document.getElementById("toggle-nl"),
+  toggleNs: document.getElementById("toggle-ns"),
+  toggleVwap: document.getElementById("toggle-vwap"),
+  saveTemplate: document.getElementById("toolbar-save-template"),
+  resetTemplate: document.getElementById("toolbar-reset-template"),
+  metaContract: document.getElementById("meta-contract"),
+  metaStatus: document.getElementById("meta-status"),
   error: document.getElementById("error-message"),
 };
 
@@ -390,21 +1847,21 @@ state.timeLabels = new Map();
 
 const chartTheme = {
   layout: {
-    background: { type: "solid", color: "#fff8ee" },
-    textColor: "#5f4a35",
+    background: { type: "solid", color: "#16171c" },
+    textColor: "#8d93a5",
     fontFamily: "IBM Plex Sans, PingFang SC, Microsoft YaHei, sans-serif",
   },
   grid: {
-    vertLines: { color: "rgba(92, 70, 47, 0.09)" },
-    horzLines: { color: "rgba(92, 70, 47, 0.09)" },
+    vertLines: { color: "rgba(133, 137, 153, 0.08)" },
+    horzLines: { color: "rgba(133, 137, 153, 0.08)" },
   },
   crosshair: {
     mode: LightweightCharts.CrosshairMode.Magnet,
-    vertLine: { color: "#a24f2f", labelBackgroundColor: "#a24f2f" },
-    horzLine: { color: "#a24f2f", labelBackgroundColor: "#a24f2f" },
+    vertLine: { color: "#7f86a3", labelBackgroundColor: "#2e3344" },
+    horzLine: { color: "#7f86a3", labelBackgroundColor: "#2e3344" },
   },
   rightPriceScale: {
-    borderColor: "rgba(92, 70, 47, 0.18)",
+    borderColor: "rgba(133, 137, 153, 0.18)",
     autoScale: true,
     minimumWidth: RIGHT_PRICE_SCALE_MIN_WIDTH,
     scaleMargins: {
@@ -413,7 +1870,7 @@ const chartTheme = {
     },
   },
   timeScale: {
-    borderColor: "rgba(92, 70, 47, 0.18)",
+    borderColor: "rgba(133, 137, 153, 0.18)",
     timeVisible: true,
     secondsVisible: false,
     rightOffset: 10,
@@ -521,9 +1978,45 @@ function clearBitgetReconnect() {
   }
 }
 
+function stopBitgetMonitor() {
+  if (state.wsMonitorTimerId) {
+    window.clearInterval(state.wsMonitorTimerId);
+    state.wsMonitorTimerId = null;
+  }
+}
+
+function startBitgetMonitor() {
+  stopBitgetMonitor();
+  state.wsMonitorTimerId = window.setInterval(async () => {
+    if (!shouldUseBrowserPush()) {
+      return;
+    }
+    const isConnected = state.wsConnection && state.wsConnection.readyState === WebSocket.OPEN;
+    const lastMessageAge = state.wsLastMessageAt > 0 ? Date.now() - state.wsLastMessageAt : Number.POSITIVE_INFINITY;
+    if (isConnected && lastMessageAge <= BITGET_WS_STALE_MS) {
+      return;
+    }
+    try {
+      disconnectBitgetStream();
+      connectBitgetStream();
+      await refreshSnapshot();
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  }, 5000);
+}
+
+function resetOrderflowState() {
+  state.orderflowTradeBuckets = new Map();
+  state.orderflowBook = { bids: [], asks: [], ts: null };
+  state.orderflowRecentTradeIds = [];
+  state.orderflowSeenTradeIds = new Set();
+}
+
 function disconnectBitgetStream() {
   clearBitgetHeartbeat();
   clearBitgetReconnect();
+  stopBitgetMonitor();
   if (state.indicatorSyncTimerId) {
     window.clearTimeout(state.indicatorSyncTimerId);
     state.indicatorSyncTimerId = null;
@@ -541,6 +2034,8 @@ function disconnectBitgetStream() {
   }
   state.wsActiveSignature = "";
   state.wsConnectingSignature = "";
+  state.wsLastMessageAt = 0;
+  resetOrderflowState();
 }
 
 function scheduleBitgetReconnect(signature) {
@@ -574,6 +2069,29 @@ function formatWsDisplayTime(timestampMs) {
   const minutes = String(date.getMinutes()).padStart(2, "0");
   const seconds = String(date.getSeconds()).padStart(2, "0");
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function orderflowBucketStartMs(timestampMs) {
+  const durationMs = getRequestedDuration() * 1000;
+  return Math.floor(timestampMs / durationMs) * durationMs;
+}
+
+function orderflowPriceKey(price) {
+  return Number(price).toFixed(6);
+}
+
+function updateOrderflowRendererContexts() {
+  state.seriesByKey.forEach((series) => {
+    if (typeof series?.setMarketContext === "function") {
+      series.setMarketContext({
+        candles: state.seriesDataByKey.get("candles") || [],
+        timeLabels: state.timeLabels,
+        syntheticToActualTime: state.wsSyntheticToActualTime,
+        tradeBuckets: state.orderflowTradeBuckets,
+        orderBook: state.orderflowBook,
+      });
+    }
+  });
 }
 
 function rebuildWsTimeIndex(snapshot) {
@@ -613,6 +2131,114 @@ function resolveSyntheticTime(actualTimeMs) {
   state.wsMaxSyntheticTime = syntheticTime;
   state.wsMaxActualTimeMs = actualTimeMs;
   return { syntheticTime, isNewBar: true };
+}
+
+function registerTradeId(tradeId) {
+  if (!tradeId) {
+    return true;
+  }
+  if (state.orderflowSeenTradeIds.has(tradeId)) {
+    return false;
+  }
+  state.orderflowSeenTradeIds.add(tradeId);
+  state.orderflowRecentTradeIds.push(tradeId);
+  while (state.orderflowRecentTradeIds.length > 10000) {
+    const removed = state.orderflowRecentTradeIds.shift();
+    if (removed) {
+      state.orderflowSeenTradeIds.delete(removed);
+    }
+  }
+  return true;
+}
+
+function inferTradeSide(rawTrade) {
+  const side = String(rawTrade.side || rawTrade.takerSide || rawTrade.tradeSide || "").toLowerCase();
+  if (side.includes("buy")) {
+    return "buy";
+  }
+  if (side.includes("sell")) {
+    return "sell";
+  }
+  const direction = String(rawTrade.buySell || "").toLowerCase();
+  if (direction.includes("buy")) {
+    return "buy";
+  }
+  if (direction.includes("sell")) {
+    return "sell";
+  }
+  return null;
+}
+
+function applyBitgetTradeUpdate(rawTrade) {
+  const timestampMs = Number(rawTrade.ts || rawTrade.cTime || rawTrade.fillTime);
+  const price = Number(rawTrade.price);
+  const size = Number(rawTrade.size || rawTrade.qty || rawTrade.amount);
+  if (!Number.isFinite(timestampMs) || !Number.isFinite(price) || !Number.isFinite(size)) {
+    return;
+  }
+  const tradeId = String(rawTrade.tradeId || rawTrade.id || `${timestampMs}:${price}:${size}:${rawTrade.side || ""}`);
+  if (!registerTradeId(tradeId)) {
+    return;
+  }
+
+  const side = inferTradeSide(rawTrade);
+  const bucketStartMs = orderflowBucketStartMs(timestampMs);
+  const { syntheticTime } = resolveSyntheticTime(bucketStartMs);
+  if (!Number.isFinite(syntheticTime)) {
+    return;
+  }
+  const bucketKey = String(bucketStartMs);
+  let bucket = state.orderflowTradeBuckets.get(bucketKey);
+  if (!bucket) {
+    bucket = { actualTimeMs: bucketStartMs, syntheticTime, levels: new Map() };
+    state.orderflowTradeBuckets.set(bucketKey, bucket);
+  } else {
+    bucket.syntheticTime = syntheticTime;
+  }
+
+  const levelKey = orderflowPriceKey(price);
+  const level = bucket.levels.get(levelKey) || { price, buy: 0, sell: 0, total: 0, delta: 0 };
+  if (side === "sell") {
+    level.sell += size;
+    level.delta -= size;
+  } else {
+    level.buy += size;
+    level.delta += size;
+  }
+  level.total += size;
+  bucket.levels.set(levelKey, level);
+
+  const minSyntheticTime = Math.max(0, (state.seriesDataByKey.get("candles") || []).reduce((minValue, item) => {
+    const time = Number(item?.time);
+    return Number.isFinite(time) ? Math.min(minValue, time) : minValue;
+  }, Number.POSITIVE_INFINITY));
+  [...state.orderflowTradeBuckets.entries()].forEach(([key, item]) => {
+    if (Number.isFinite(minSyntheticTime) && item.syntheticTime < minSyntheticTime - 2) {
+      state.orderflowTradeBuckets.delete(key);
+    }
+  });
+
+  updateOrderflowRendererContexts();
+}
+
+function applyBitgetOrderBookSnapshot(book) {
+  const normalizeLevels = (levels) =>
+    (Array.isArray(levels) ? levels : [])
+      .map((level) => {
+        const price = Number(level?.[0]);
+        const size = Number(level?.[1]);
+        if (!Number.isFinite(price) || !Number.isFinite(size)) {
+          return null;
+        }
+        return { price, size };
+      })
+      .filter(Boolean);
+  state.orderflowBook = {
+    bids: normalizeLevels(book?.bids),
+    asks: normalizeLevels(book?.asks),
+    ts: Number(book?.ts || Date.now()),
+  };
+  updateOrderflowRendererContexts();
 }
 
 function syncCurrentPriceLine(price, color) {
@@ -711,6 +2337,7 @@ function applyBitgetWsCandleUpdate(rawRow) {
   const volumeSeries = state.seriesByKey.get("volume");
   setSeriesData("candles", candleSeries, candles);
   setSeriesData("volume", volumeSeries, volumeSeriesData);
+  updateOrderflowRendererContexts();
 
   els.lastPrice.textContent = close.toFixed(2);
   els.lastPrice.style.color = close >= open ? "#089981" : "#f23645";
@@ -727,6 +2354,7 @@ function handleBitgetWsMessage(event) {
   if (typeof event.data !== "string" || !event.data || event.data === "pong") {
     return;
   }
+  state.wsLastMessageAt = Date.now();
   const payload = JSON.parse(event.data);
   if (payload.event === "subscribe" || payload.event === "unsubscribe") {
     return;
@@ -734,8 +2362,22 @@ function handleBitgetWsMessage(event) {
   if (payload.event === "error") {
     throw new Error(payload.msg || payload.code || "Bitget 订阅失败");
   }
+  const channel = payload.arg?.channel || "";
   const rows = payload.data || [];
-  rows.forEach((row) => applyBitgetWsCandleUpdate(row));
+  if (channel.startsWith("candle")) {
+    rows.forEach((row) => applyBitgetWsCandleUpdate(row));
+    return;
+  }
+  if (channel === "trade") {
+    rows.forEach((row) => applyBitgetTradeUpdate(row));
+    return;
+  }
+  if (channel.startsWith("books")) {
+    const first = rows[0];
+    if (first) {
+      applyBitgetOrderBookSnapshot(first);
+    }
+  }
 }
 
 function connectBitgetStream() {
@@ -769,6 +2411,7 @@ function connectBitgetStream() {
     }
     state.wsActiveSignature = signature;
     state.wsConnectingSignature = "";
+    state.wsLastMessageAt = Date.now();
     els.error.textContent = "";
     socket.send(
       JSON.stringify({
@@ -779,10 +2422,21 @@ function connectBitgetStream() {
             channel,
             instId: getRequestedSymbol(),
           },
+          {
+            instType: "USDT-FUTURES",
+            channel: "trade",
+            instId: getRequestedSymbol(),
+          },
+          {
+            instType: "USDT-FUTURES",
+            channel: "books15",
+            instId: getRequestedSymbol(),
+          },
         ],
       })
     );
     startBitgetHeartbeat(socket, signature);
+    startBitgetMonitor();
   };
 
   socket.onmessage = (event) => {
@@ -845,6 +2499,110 @@ function updateIndicatorParamState(indicatorId, key, value) {
     state.indicatorParams[indicatorId] = {};
   }
   state.indicatorParams[indicatorId][key] = value;
+}
+
+function buildDefaultTerminalTemplate() {
+  return {
+    provider: state.config?.provider || "bitget",
+    symbol: state.config?.symbol || "BTCUSDT",
+    duration_seconds: state.config?.duration_seconds || 60,
+    bar_mode: state.config?.bar_mode || "time",
+    range_ticks: state.config?.range_ticks || 10,
+    brick_length: state.config?.brick_length || 10000,
+    orderflow_gl: {
+      view_mode: "profile",
+      profile_opacity: 0.78,
+      footprint_opacity: 0.9,
+      lock_price_center: true,
+    },
+    toggles: {
+      cluster: true,
+      text: true,
+      candle: true,
+      oi: true,
+      nl: true,
+      ns: true,
+      vwap: true,
+    },
+  };
+}
+
+function buildCurrentTerminalTemplate() {
+  return {
+    provider: getRequestedProvider(),
+    symbol: getRequestedSymbol(),
+    duration_seconds: getRequestedDuration(),
+    bar_mode: getRequestedBarMode(),
+    range_ticks: getRequestedRangeTicks(),
+    brick_length: getRequestedBrickLength(),
+    orderflow_gl: {
+      view_mode: state.indicatorParams.orderflow_gl?.view_mode || "profile",
+      profile_opacity: Number(state.indicatorParams.orderflow_gl?.profile_opacity ?? 0.78),
+      footprint_opacity: Number(state.indicatorParams.orderflow_gl?.footprint_opacity ?? 0.9),
+      lock_price_center: Boolean(state.indicatorParams.orderflow_gl?.lock_price_center ?? true),
+    },
+    toggles: { ...state.terminalToggles },
+  };
+}
+
+function persistTerminalTemplate(template) {
+  window.localStorage.setItem(TERMINAL_TEMPLATE_STORAGE_KEY, JSON.stringify(template));
+}
+
+function loadSavedTerminalTemplate() {
+  const raw = window.localStorage.getItem(TERMINAL_TEMPLATE_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function syncToolbarToggles() {
+  if (els.toggleCluster) els.toggleCluster.checked = Boolean(state.terminalToggles.cluster);
+  if (els.toggleText) els.toggleText.checked = Boolean(state.terminalToggles.text);
+  if (els.toggleCandle) els.toggleCandle.checked = Boolean(state.terminalToggles.candle);
+  if (els.toggleOi) els.toggleOi.checked = Boolean(state.terminalToggles.oi);
+  if (els.toggleNl) els.toggleNl.checked = Boolean(state.terminalToggles.nl);
+  if (els.toggleNs) els.toggleNs.checked = Boolean(state.terminalToggles.ns);
+  if (els.toggleVwap) els.toggleVwap.checked = Boolean(state.terminalToggles.vwap);
+}
+
+async function applyTerminalTemplate(template) {
+  const nextTemplate = template || buildDefaultTerminalTemplate();
+  state.terminalToggles = {
+    ...state.terminalToggles,
+    ...(nextTemplate.toggles || {}),
+  };
+  syncToolbarToggles();
+
+  const nextOrderflow = {
+    ...state.indicatorParams.orderflow_gl,
+    ...(nextTemplate.orderflow_gl || {}),
+  };
+  state.indicatorParams.orderflow_gl = nextOrderflow;
+
+  if (els.toolbarProvider) els.toolbarProvider.value = String(nextTemplate.provider || state.config.provider);
+  if (els.providerSelect) els.providerSelect.value = String(nextTemplate.provider || state.config.provider);
+  if (els.toolbarSymbol) els.toolbarSymbol.value = String(nextTemplate.symbol || state.config.symbol);
+  if (els.symbolSelect) els.symbolSelect.value = String(nextTemplate.symbol || state.config.symbol);
+  if (els.toolbarDuration) els.toolbarDuration.value = String(nextTemplate.duration_seconds || state.config.duration_seconds);
+  if (els.durationSelect) els.durationSelect.value = String(nextTemplate.duration_seconds || state.config.duration_seconds);
+  if (els.toolbarBarMode) els.toolbarBarMode.value = String(nextTemplate.bar_mode || state.config.bar_mode);
+  if (els.barModeSelect) els.barModeSelect.value = String(nextTemplate.bar_mode || state.config.bar_mode);
+  if (els.toolbarRangeTicks) els.toolbarRangeTicks.value = String(nextTemplate.range_ticks || state.config.range_ticks || 10);
+  if (els.rangeTicksInput) els.rangeTicksInput.value = String(nextTemplate.range_ticks || state.config.range_ticks || 10);
+  if (els.toolbarBrickLength) els.toolbarBrickLength.value = String(nextTemplate.brick_length || state.config.brick_length || 10000);
+  if (els.brickLengthInput) els.brickLengthInput.value = String(nextTemplate.brick_length || state.config.brick_length || 10000);
+  if (els.toolbarOrderflowView) els.toolbarOrderflowView.value = String(nextOrderflow.view_mode || "profile");
+  if (els.toolbarCenterLock) els.toolbarCenterLock.checked = Boolean(nextOrderflow.lock_price_center ?? true);
+
+  syncBarModeControls(getRequestedBarMode());
+  await refreshConfig(getRequestedProvider());
+  await refreshSnapshot();
 }
 
 function indicatorParamValue(indicatorId, param) {
@@ -929,6 +2687,9 @@ function syncMarketHeader(symbolLabel, durationSeconds, barMode, rangeTicks) {
   els.title.textContent = `${symbolLabel} 图表工作台`;
   els.symbol.textContent = symbolLabel;
   els.duration.textContent = formatBarModeLabel(barMode, durationSeconds, rangeTicks);
+  if (els.metaContract) {
+    els.metaContract.textContent = symbolLabel;
+  }
 }
 
 function formatDetailValue(value, fallback = "--") {
@@ -1091,39 +2852,63 @@ function hasDuckdbLocalData(contract) {
 
 function buildDurationOptions(options, activeValue) {
   els.durationSelect.innerHTML = "";
+  if (els.toolbarDuration) {
+    els.toolbarDuration.innerHTML = "";
+  }
   options.forEach((seconds) => {
     const option = document.createElement("option");
     option.value = String(seconds);
     option.textContent = formatDurationLabel(seconds);
     option.selected = seconds === activeValue;
     els.durationSelect.append(option);
+    if (els.toolbarDuration) {
+      const clone = option.cloneNode(true);
+      els.toolbarDuration.append(clone);
+    }
   });
 }
 
 function buildProviderOptions(options, activeValue) {
   els.providerSelect.innerHTML = "";
+  if (els.toolbarProvider) {
+    els.toolbarProvider.innerHTML = "";
+  }
   options.forEach((providerId) => {
     const option = document.createElement("option");
     option.value = providerId;
     option.textContent = providerId;
     option.selected = providerId === activeValue;
     els.providerSelect.append(option);
+    if (els.toolbarProvider) {
+      const clone = option.cloneNode(true);
+      els.toolbarProvider.append(clone);
+    }
   });
 }
 
 function buildBarModeOptions(options, activeValue) {
   els.barModeSelect.innerHTML = "";
+  if (els.toolbarBarMode) {
+    els.toolbarBarMode.innerHTML = "";
+  }
   options.forEach((mode) => {
     const option = document.createElement("option");
     option.value = mode.id;
     option.textContent = mode.label;
     option.selected = mode.id === activeValue;
     els.barModeSelect.append(option);
+    if (els.toolbarBarMode) {
+      const clone = option.cloneNode(true);
+      els.toolbarBarMode.append(clone);
+    }
   });
 }
 
 function buildContractOptions(contracts, activeSymbol) {
   els.symbolSelect.innerHTML = "";
+  if (els.toolbarSymbol) {
+    els.toolbarSymbol.innerHTML = "";
+  }
   const provider = getRequestedProvider() || state.activeProvider || state.config?.provider || "";
   const normalizedContracts = contracts.length
     ? contracts
@@ -1136,6 +2921,10 @@ function buildContractOptions(contracts, activeSymbol) {
     option.disabled = !hasLocalData;
     option.selected = contract.symbol === activeSymbol;
     els.symbolSelect.append(option);
+    if (els.toolbarSymbol) {
+      const clone = option.cloneNode(true);
+      els.toolbarSymbol.append(clone);
+    }
   });
 }
 
@@ -1238,6 +3027,194 @@ function sanitizePricePaneIndicators(snapshot) {
   };
 }
 
+function augmentTerminalPanels(snapshot) {
+  const toggles = state.terminalToggles;
+  const orderflowIndicator = (snapshot.indicators || []).find((item) => item.id === "orderflow_gl");
+  const matrixSeries = orderflowIndicator?.series?.find((series) => series.id === "orderflow_gl_matrix");
+  const points = Array.isArray(matrixSeries?.data) ? matrixSeries.data : [];
+  if (points.length === 0) {
+    return snapshot;
+  }
+
+  const indicators = [...(snapshot.indicators || [])];
+  const filteredIndicators = indicators.filter((indicator) => toggles.cluster || indicator.id !== "orderflow_gl");
+  filteredIndicators.forEach((indicator) => {
+    if (indicator.id === "orderflow_gl") {
+      indicator.series = indicator.series.map((series) =>
+        series.id === "orderflow_gl_matrix"
+          ? {
+              ...series,
+              options: {
+                ...(series.options || {}),
+                showText: toggles.text,
+              },
+            }
+          : series
+      );
+    }
+  });
+
+  const nlData = points.map((point) => {
+    const value = Number(point.dOI_5m || 0);
+    return { time: point.time, value: value > 0 ? value : 0, color: "#69ff7b" };
+  });
+  const nsData = points.map((point) => {
+    const value = Number(point.dOI_5m || 0);
+    return { time: point.time, value: value < 0 ? value : 0, color: "#ff335f" };
+  });
+  let oiRunning = 0;
+  const oiData = points.map((point) => {
+    oiRunning += Number(point.dOI_5m || 0);
+    return { time: point.time, value: oiRunning };
+  });
+  let cvdRunning = 0;
+  const cvdData = points.map((point) => {
+    cvdRunning += Number(point.delta_ratio_5m || 0);
+    return { time: point.time, value: cvdRunning };
+  });
+  let vwapVolume = 0;
+  let vwapNotional = 0;
+  const vwapData = (snapshot.candles || []).map((candle, index) => {
+    const volume = Number(snapshot.volume?.[index]?.value || 0);
+    const typical = (Number(candle.high) + Number(candle.low) + Number(candle.close)) / 3;
+    vwapVolume += volume;
+    vwapNotional += typical * volume;
+    return { time: candle.time, value: vwapVolume > 0 ? vwapNotional / vwapVolume : typical };
+  });
+  const statsData = points.map((point, index) => ({
+    time: point.time,
+    volume_stat: Number(snapshot.volume?.[index]?.value || 0),
+    delta_stat: Number(point.delta_ratio_5m || 0),
+    doi_stat: Number(point.dOI_5m || 0),
+    cvd_stat: Number(cvdData[index]?.value || 0),
+  }));
+
+  return {
+    ...snapshot,
+    indicators: [
+      ...filteredIndicators,
+      ...(toggles.vwap ? [{
+        id: "terminal_vwap",
+        name: "vWap",
+        pane: "price",
+        series: [
+          {
+            id: "terminal_vwap_line",
+            name: "vWap",
+            pane: "price",
+            series_type: "line",
+            data: vwapData,
+            options: { color: "#7ad0ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false },
+          },
+        ],
+      }] : []),
+      ...(toggles.nl ? [{
+        id: "terminal_nl",
+        name: "NL",
+        pane: "indicator",
+        series: [
+          {
+            id: "terminal_nl_zero",
+            name: "NL Zero",
+            pane: "indicator",
+            series_type: "line",
+            data: nlData.map((item) => ({ time: item.time, value: 0 })),
+            options: { color: "rgba(255,255,255,0.18)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
+          },
+          {
+            id: "terminal_nl_hist",
+            name: "Net Longs",
+            pane: "indicator",
+            series_type: "histogram",
+            data: nlData,
+            options: { base: 0, priceLineVisible: false, color: "#77ff8b", lastValueVisible: false },
+          },
+        ],
+      }] : []),
+      ...(toggles.ns ? [{
+        id: "terminal_ns",
+        name: "NS",
+        pane: "indicator",
+        series: [
+          {
+            id: "terminal_ns_zero",
+            name: "NS Zero",
+            pane: "indicator",
+            series_type: "line",
+            data: nsData.map((item) => ({ time: item.time, value: 0 })),
+            options: { color: "rgba(255,255,255,0.18)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
+          },
+          {
+            id: "terminal_ns_hist",
+            name: "Net Shorts",
+            pane: "indicator",
+            series_type: "histogram",
+            data: nsData,
+            options: { base: 0, priceLineVisible: false, color: "#ff335f", lastValueVisible: false },
+          },
+        ],
+      }] : []),
+      ...(toggles.oi ? [{
+        id: "terminal_oi",
+        name: "OI",
+        pane: "indicator",
+        series: [
+          {
+            id: "terminal_oi_zero",
+            name: "OI Zero",
+            pane: "indicator",
+            series_type: "line",
+            data: oiData.map((item) => ({ time: item.time, value: 0 })),
+            options: { color: "rgba(255,255,255,0.12)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
+          },
+          {
+            id: "terminal_oi_line",
+            name: "Open Interest",
+            pane: "indicator",
+            series_type: "line",
+            data: oiData,
+            options: { color: "#8db1ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false },
+          },
+          {
+            id: "terminal_oi_change_hist",
+            name: "OI Change",
+            pane: "indicator",
+            series_type: "histogram",
+            data: points.map((point) => ({
+              time: point.time,
+              value: Number(point.dOI_5m || 0),
+              color: Number(point.dOI_5m || 0) >= 0 ? "#8db1ff" : "#b30808",
+            })),
+            options: { base: 0, priceLineVisible: false, lastValueVisible: false },
+          },
+        ],
+      }] : []),
+      {
+        id: "terminal_stats",
+        name: "Footprint Stats",
+        pane: "indicator",
+        series: [
+          {
+            id: "terminal_stats_strip",
+            name: "Footprint Stats",
+            pane: "indicator",
+            series_type: "footprint-stats",
+            data: statsData,
+            options: {
+              rows: [
+                { key: "volume_stat", label: "Volume", color: "rgba(111, 142, 207, 0.85)", scale: Math.max(...statsData.map((item) => item.volume_stat || 0), 1), format: (value) => `${Math.round(value)}` },
+                { key: "delta_stat", label: "Delta", color: "rgba(255, 96, 96, 0.85)", scale: Math.max(...statsData.map((item) => Math.abs(item.delta_stat || 0)), 1), format: (value) => value.toFixed(2) },
+                { key: "doi_stat", label: "dOI", color: "rgba(105, 255, 123, 0.85)", scale: Math.max(...statsData.map((item) => Math.abs(item.doi_stat || 0)), 1), format: (value) => value.toFixed(0) },
+                { key: "cvd_stat", label: "CVD", color: "rgba(226, 226, 236, 0.85)", scale: Math.max(...statsData.map((item) => Math.abs(item.cvd_stat || 0)), 1), format: (value) => value.toFixed(2) },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function buildIndicatorSelector(indicators, defaults) {
   els.indicatorForm.innerHTML = "";
   indicators.forEach((indicator) => {
@@ -1290,6 +3267,16 @@ function buildIndicatorSelector(indicators, defaults) {
     label.append(checkbox, content);
     els.indicatorForm.append(label);
   });
+}
+
+async function updateOrderflowIndicatorParam(key, value) {
+  if (!state.indicatorParams.orderflow_gl) {
+    state.indicatorParams.orderflow_gl = {};
+  }
+  state.indicatorParams.orderflow_gl[key] = value;
+  const snapshot = await fetchSnapshotPayload();
+  applySnapshot(snapshot);
+  syncAutoRefresh(snapshot.refresh_ms ?? state.config?.refresh_ms ?? 0);
 }
 
 function toggleParamInputs(indicatorId, enabled) {
@@ -1366,6 +3353,10 @@ function canApplyIncrementalSeriesUpdate(previousData, nextData) {
 }
 
 function setSeriesData(seriesKey, series, data) {
+  if (typeof series?.setData !== "function") {
+    state.seriesDataByKey.set(seriesKey, data);
+    return;
+  }
   const previousData = state.seriesDataByKey.get(seriesKey);
   if (typeof series?.update === "function" && canApplyIncrementalSeriesUpdate(previousData, data)) {
     const startIndex = Math.max(0, previousData.length - 1);
@@ -1387,8 +3378,11 @@ function removeSeriesByKey(seriesKey) {
   state.bandPrimitiveByKey.delete(seriesKey);
 
   const chart = state.seriesChartByKey.get(seriesKey);
-  if (chart && series) {
+  if (chart && series && typeof chart.removeSeries === "function" && typeof series.applyOptions === "function") {
     chart.removeSeries(series);
+  }
+  if (series && typeof series.destroy === "function") {
+    series.destroy();
   }
 
   state.seriesByKey.delete(seriesKey);
@@ -1495,6 +3489,7 @@ function firstDefinedPointIndex(points) {
 function indicatorReadyIndex(snapshot) {
   const seriesIndices = snapshot.indicators.flatMap((indicator) =>
     indicator.series
+      .filter((series) => Array.isArray(series.data))
       .map((series) => firstDefinedPointIndex(series.data))
       .filter((index) => index >= 0)
   );
@@ -1550,6 +3545,8 @@ function focusComputedBars(chart, snapshot) {
 function paneHeights(panes) {
   const total = panes.length;
   const hasVolumePane = panes.includes(VOLUME_PANE_ID);
+  const hasOrderflowPane = panes.includes("orderflow_gl");
+  const hasTerminalStats = panes.includes("terminal_stats");
 
   if (!hasVolumePane) {
     if (total <= 1) {
@@ -1573,6 +3570,18 @@ function paneHeights(panes) {
   const indicatorCount = total - 2;
   if (indicatorCount <= 0) {
     return [82, 18];
+  }
+  if (hasTerminalStats && panes.includes("terminal_nl") && panes.includes("terminal_ns") && panes.includes("terminal_oi")) {
+    return [32, 9, 18, 14, 14, 17, 16];
+  }
+  if (hasOrderflowPane && indicatorCount === 1) {
+    return [38, 10, 52];
+  }
+  if (hasOrderflowPane && indicatorCount === 2) {
+    return [36, 10, 38, 16];
+  }
+  if (hasOrderflowPane && indicatorCount === 3) {
+    return [34, 10, 34, 11, 11];
   }
   if (indicatorCount === 1) {
     return [46, 14, 40];
@@ -1723,11 +3732,11 @@ function rebuildCharts() {
   const volumePaneEntry = state.charts.find((entry) => entry.paneId === VOLUME_PANE_ID);
   const volumeChart = volumePaneEntry?.chart || priceChart;
   const candleSeries = priceChart.addCandlestickSeries({
-    upColor: "#197278",
-    downColor: "#c44536",
+    upColor: "#6eff77",
+    downColor: "#ff335f",
     borderVisible: false,
-    wickUpColor: "#197278",
-    wickDownColor: "#c44536",
+    wickUpColor: "#6eff77",
+    wickDownColor: "#ff335f",
     priceLineVisible: false,
     autoscaleInfoProvider: (original) => {
       const autoscaleInfo = original();
@@ -1792,7 +3801,8 @@ function rebuildCharts() {
   state.seriesChartByKey.set("volume", volumeChart);
 }
 
-function createSeries(chart, definition) {
+function createSeries(paneEntry, definition) {
+  const chart = paneEntry.chart;
   const { fillToSeriesId, fillColor, markers, ...renderOptions } = definition.options || {};
   switch (definition.series_type) {
     case "line":
@@ -1801,6 +3811,10 @@ function createSeries(chart, definition) {
       return chart.addHistogramSeries(renderOptions);
     case "area":
       return chart.addAreaSeries(renderOptions);
+    case "webgl-orderflow":
+      return new WebGLOrderflowRenderer(paneEntry, definition);
+    case "footprint-stats":
+      return new TerminalStatsRenderer(paneEntry, definition);
     default:
       throw new Error(`暂不支持的序列类型: ${definition.series_type}`);
   }
@@ -1866,8 +3880,26 @@ function applySnapshot(snapshot) {
   els.providerSelect.value = state.activeProvider;
   els.barModeSelect.value = state.activeBarMode;
   els.durationSelect.value = String(snapshot.duration_seconds);
+  if (els.toolbarProvider) {
+    els.toolbarProvider.value = state.activeProvider;
+  }
+  if (els.toolbarSymbol) {
+    els.toolbarSymbol.value = snapshot.symbol;
+  }
+  if (els.toolbarDuration) {
+    els.toolbarDuration.value = String(snapshot.duration_seconds);
+  }
+  if (els.toolbarBarMode) {
+    els.toolbarBarMode.value = state.activeBarMode;
+  }
   els.rangeTicksInput.value = String(state.activeRangeTicks);
   els.brickLengthInput.value = String(state.activeBrickLength);
+  if (els.toolbarRangeTicks) {
+    els.toolbarRangeTicks.value = String(state.activeRangeTicks);
+  }
+  if (els.toolbarBrickLength) {
+    els.toolbarBrickLength.value = String(state.activeBrickLength);
+  }
   syncBarModeControls(state.activeBarMode);
   syncMarketHeader(
     snapshot.symbol_label || snapshot.symbol,
@@ -1880,9 +3912,13 @@ function applySnapshot(snapshot) {
   els.lastPrice.textContent = snapshot.last_close.toFixed(2);
   els.lastPrice.style.color = snapshot.last_color;
   els.lastUpdate.textContent = snapshot.last_time;
+  if (els.metaStatus) {
+    els.metaStatus.textContent = `Realtime ${state.activeProvider} · ${state.activeBarMode} · ${snapshot.last_time}`;
+  }
 
   const sanitizedSnapshot = sanitizePricePaneIndicators(snapshot);
-  const trimmedSnapshot = trimSnapshotForDisplay(sanitizedSnapshot);
+  const augmentedSnapshot = augmentTerminalPanels(sanitizedSnapshot);
+  const trimmedSnapshot = trimSnapshotForDisplay(augmentedSnapshot);
   const displaySnapshot = trimmedSnapshot;
   state.timeLabels = new Map(Object.entries(displaySnapshot.time_labels || {}));
   const previousCandleCount = (state.seriesDataByKey.get("candles") || []).length;
@@ -1890,6 +3926,13 @@ function applySnapshot(snapshot) {
   const volumeSeries = state.seriesByKey.get("volume");
   setSeriesData("candles", candleSeries, displaySnapshot.candles);
   setSeriesData("volume", volumeSeries, displaySnapshot.volume);
+  candleSeries?.applyOptions({
+    upColor: state.terminalToggles.candle ? "#6eff77" : "rgba(0,0,0,0)",
+    downColor: state.terminalToggles.candle ? "#ff335f" : "rgba(0,0,0,0)",
+    wickUpColor: state.terminalToggles.candle ? "#6eff77" : "rgba(0,0,0,0)",
+    wickDownColor: state.terminalToggles.candle ? "#ff335f" : "rgba(0,0,0,0)",
+  });
+  updateOrderflowRendererContexts();
   const activeBandPrimaryKeys = new Set();
 
   if (state.currentPriceLine) {
@@ -1918,12 +3961,17 @@ function applySnapshot(snapshot) {
       activeSeriesKeys.add(key);
       let series = state.seriesByKey.get(key);
       if (!series) {
-        series = createSeries(paneEntry.chart, seriesDefinition);
+        series = createSeries(paneEntry, seriesDefinition);
         state.seriesByKey.set(key, series);
-        state.seriesChartByKey.set(key, paneEntry.chart);
+        if (typeof series.applyOptions === "function") {
+          state.seriesChartByKey.set(key, paneEntry.chart);
+        }
         if (!state.primarySeriesKeyByPane.has(paneId)) {
           state.primarySeriesKeyByPane.set(paneId, key);
         }
+      }
+      if (typeof series.setDefinitionOptions === "function") {
+        series.setDefinitionOptions(seriesDefinition.options || {});
       }
       setSeriesData(key, series, seriesDefinition.data);
       if (typeof series.setMarkers === "function") {
@@ -2111,6 +4159,11 @@ function resizeCharts() {
       height: entry.container.clientHeight,
     });
   });
+  state.seriesByKey.forEach((series) => {
+    if (typeof series?.resize === "function") {
+      series.resize();
+    }
+  });
   updatePaneLabelPositions();
 }
 
@@ -2132,8 +4185,33 @@ async function boot() {
   buildContractOptions(state.config.contracts || [], state.config.symbol);
   buildBarModeOptions(state.config.bar_modes || [{ id: "time", label: "时间 K 线" }], state.activeBarMode);
   buildDurationOptions(state.config.duration_options || [state.config.duration_seconds], state.config.duration_seconds);
+  if (els.toolbarProvider) {
+    els.toolbarProvider.value = state.config.provider;
+  }
+  if (els.toolbarSymbol) {
+    els.toolbarSymbol.value = state.config.symbol;
+  }
+  if (els.toolbarDuration) {
+    els.toolbarDuration.value = String(state.config.duration_seconds);
+  }
+  if (els.toolbarBarMode) {
+    els.toolbarBarMode.value = state.activeBarMode;
+  }
+  if (els.toolbarOrderflowView) {
+    els.toolbarOrderflowView.value = String(state.indicatorParams.orderflow_gl?.view_mode || "profile");
+  }
   els.rangeTicksInput.value = String(state.activeRangeTicks);
   els.brickLengthInput.value = String(state.activeBrickLength);
+  if (els.toolbarRangeTicks) {
+    els.toolbarRangeTicks.value = String(state.activeRangeTicks);
+  }
+  if (els.toolbarBrickLength) {
+    els.toolbarBrickLength.value = String(state.activeBrickLength);
+  }
+  if (els.toolbarCenterLock) {
+    els.toolbarCenterLock.checked = Boolean(state.indicatorParams.orderflow_gl?.lock_price_center ?? true);
+  }
+  syncToolbarToggles();
   syncBarModeControls(state.activeBarMode);
   syncMarketHeader(
     state.config.symbol_label || state.config.symbol,
@@ -2143,6 +4221,14 @@ async function boot() {
   );
   renderProviderMeta(state.config);
   rebuildWsTimeIndex({ candles: [], time_labels: {} });
+  const savedTemplate = loadSavedTerminalTemplate();
+  if (savedTemplate) {
+    try {
+      await applyTerminalTemplate(savedTemplate);
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  }
 
   els.symbolSelect.addEventListener("change", async () => {
     try {
@@ -2154,6 +4240,10 @@ async function boot() {
     } catch (error) {
       els.error.textContent = error.message;
     }
+  });
+  els.toolbarSymbol?.addEventListener("change", async () => {
+    els.symbolSelect.value = els.toolbarSymbol.value;
+    els.symbolSelect.dispatchEvent(new Event("change"));
   });
   els.providerSelect.addEventListener("change", async () => {
     const nextProvider = getRequestedProvider();
@@ -2172,6 +4262,10 @@ async function boot() {
     } catch (error) {
       els.error.textContent = error.message;
     }
+  });
+  els.toolbarProvider?.addEventListener("change", async () => {
+    els.providerSelect.value = els.toolbarProvider.value;
+    els.providerSelect.dispatchEvent(new Event("change"));
   });
   els.barModeSelect.addEventListener("change", async () => {
     const nextBarMode = getRequestedBarMode();
@@ -2199,6 +4293,72 @@ async function boot() {
       els.error.textContent = error.message;
     }
   });
+  els.toolbarDuration?.addEventListener("change", async () => {
+    els.durationSelect.value = els.toolbarDuration.value;
+    els.durationSelect.dispatchEvent(new Event("change"));
+  });
+  els.toolbarBarMode?.addEventListener("change", async () => {
+    els.barModeSelect.value = els.toolbarBarMode.value;
+    els.barModeSelect.dispatchEvent(new Event("change"));
+  });
+  els.toolbarRangeTicks?.addEventListener("change", async () => {
+    els.rangeTicksInput.value = els.toolbarRangeTicks.value;
+    els.rangeTicksInput.dispatchEvent(new Event("change"));
+  });
+  els.toolbarBrickLength?.addEventListener("change", async () => {
+    els.brickLengthInput.value = els.toolbarBrickLength.value;
+    els.brickLengthInput.dispatchEvent(new Event("change"));
+  });
+  els.toolbarOrderflowView?.addEventListener("change", async () => {
+    try {
+      await updateOrderflowIndicatorParam("view_mode", els.toolbarOrderflowView.value);
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
+  els.toolbarCenterLock?.addEventListener("change", async () => {
+    try {
+      await updateOrderflowIndicatorParam("lock_price_center", els.toolbarCenterLock.checked);
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
+  [
+    ["cluster", els.toggleCluster],
+    ["text", els.toggleText],
+    ["candle", els.toggleCandle],
+    ["oi", els.toggleOi],
+    ["nl", els.toggleNl],
+    ["ns", els.toggleNs],
+    ["vwap", els.toggleVwap],
+  ].forEach(([key, element]) => {
+    element?.addEventListener("change", async () => {
+      state.terminalToggles[key] = element.checked;
+      try {
+        await refreshSnapshot();
+      } catch (error) {
+        els.error.textContent = error.message;
+      }
+    });
+  });
+  els.saveTemplate?.addEventListener("click", () => {
+    persistTerminalTemplate(buildCurrentTerminalTemplate());
+    if (els.metaStatus) {
+      els.metaStatus.textContent = "Template saved locally";
+    }
+  });
+  els.resetTemplate?.addEventListener("click", async () => {
+    try {
+      const defaults = buildDefaultTerminalTemplate();
+      persistTerminalTemplate(defaults);
+      await applyTerminalTemplate(defaults);
+      if (els.metaStatus) {
+        els.metaStatus.textContent = "Default template restored";
+      }
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
   els.rangeTicksInput.addEventListener("change", async () => {
     try {
       await refreshSnapshot();
@@ -2216,6 +4376,25 @@ async function boot() {
 
   buildIndicatorSelector(state.config.indicators, state.config.default_indicator_ids);
   rebuildCharts();
+  window.addEventListener("keydown", async (event) => {
+    if (event.target && ["INPUT", "SELECT", "TEXTAREA"].includes(event.target.tagName)) {
+      return;
+    }
+    try {
+      if (event.key === "1") {
+        await updateOrderflowIndicatorParam("view_mode", "profile");
+      } else if (event.key === "2") {
+        await updateOrderflowIndicatorParam("view_mode", "overlay");
+      } else if (event.key === "3") {
+        await updateOrderflowIndicatorParam("view_mode", "ladder");
+      } else if (event.key.toLowerCase() === "c") {
+        const currentValue = Boolean(state.indicatorParams.orderflow_gl?.lock_price_center ?? true);
+        await updateOrderflowIndicatorParam("lock_price_center", !currentValue);
+      }
+    } catch (error) {
+      els.error.textContent = error.message;
+    }
+  });
   await refreshSnapshot();
   window.addEventListener("beforeunload", () => {
     disconnectBitgetStream();

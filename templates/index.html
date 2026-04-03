@@ -4,76 +4,95 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Bitget Market Chart</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=asset_versions.styles_css) }}" />
   <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
   <div class="shell">
+    <aside class="rail">
+      <div class="rail-brand">QH</div>
+      <nav class="rail-nav">
+        <button class="rail-btn is-active" type="button">Profile</button>
+        <button class="rail-btn" type="button">Sett.</button>
+        <button class="rail-btn" type="button">Color</button>
+        <button class="rail-btn" type="button">Tpl.</button>
+        <button class="rail-btn" type="button">Mrk.</button>
+        <button class="rail-btn" type="button">VA</button>
+        <button class="rail-btn" type="button">POC</button>
+        <button class="rail-btn" type="button">CPL</button>
+        <button class="rail-btn" type="button">CPR</button>
+        <button class="rail-btn" type="button">TPO</button>
+        <button class="rail-btn" type="button">Tree</button>
+      </nav>
+    </aside>
     <aside class="sidebar">
       <div class="brand">
-        <div class="eyebrow">Market Workbench</div>
-        <h1 id="page-title">Bitget 行情图表</h1>
+        <div class="eyebrow">Cluster Terminal</div>
+        <h1 id="page-title">Bitget Orderflow Terminal</h1>
+        <div class="brand-subline">
+          <span id="symbol-name">--</span>
+          <span class="brand-dot">•</span>
+          <span id="duration-name">--</span>
+        </div>
       </div>
       <div class="panel">
-        <div class="panel-label">行情</div>
+        <div class="panel-label">Market</div>
         <div class="control-grid">
           <label class="control-field">
-            <span>数据源切换</span>
+            <span>Provider</span>
             <select id="provider-select"></select>
           </label>
           <label class="control-field">
-            <span>合约切换</span>
+            <span>Symbol</span>
             <select id="symbol-select"></select>
           </label>
           <label class="control-field">
-            <span>图表类型</span>
+            <span>Chart Type</span>
             <select id="bar-mode-select"></select>
           </label>
           <label class="control-field">
-            <span>周期切换</span>
+            <span>Timeframe</span>
             <select id="duration-select"></select>
           </label>
           <label class="control-field">
-            <span id="bar-size-label">Range Tick</span>
+            <span id="bar-size-label">Price Tick</span>
             <input id="range-ticks-input" type="number" min="1" step="1" />
           </label>
           <label class="control-field">
-            <span id="history-size-label">显示根数</span>
+            <span id="history-size-label">Bars</span>
             <input id="brick-length-input" type="number" min="100" step="100" />
           </label>
         </div>
-        <div class="field"><span>数据源</span><strong id="provider-name">--</strong></div>
-        <div class="field"><span>合约</span><strong id="symbol-name">--</strong></div>
-        <div class="field"><span>图表</span><strong id="duration-name">--</strong></div>
-        <div class="field"><span>最新价</span><strong id="last-price">--</strong></div>
-        <div class="field"><span>更新时间</span><strong id="last-update">--</strong></div>
-        <div class="field"><span>光标时间</span><strong id="cursor-time">--</strong></div>
+        <div class="field"><span>Provider</span><strong id="provider-name">--</strong></div>
+        <div class="field"><span>Last</span><strong id="last-price">--</strong></div>
+        <div class="field"><span>Update</span><strong id="last-update">--</strong></div>
+        <div class="field"><span>Cursor</span><strong id="cursor-time">--</strong></div>
         <div id="provider-hint" class="subhint">--</div>
         <div id="contract-detail-card" class="detail-card">
-          <div class="detail-card-title">本地数据覆盖</div>
+          <div class="detail-card-title">Contract Detail</div>
           <div class="detail-grid">
             <div class="detail-item">
-              <span>起始时间</span>
+              <span>First</span>
               <strong id="detail-first-tick">--</strong>
             </div>
             <div class="detail-item">
-              <span>结束时间</span>
+              <span>Last</span>
               <strong id="detail-last-tick">--</strong>
             </div>
             <div class="detail-item">
-              <span>Tick 数量</span>
+              <span>Ticks</span>
               <strong id="detail-tick-count">--</strong>
             </div>
             <div class="detail-item">
-              <span>最小变动</span>
+              <span>Tick Size</span>
               <strong id="detail-price-tick">--</strong>
             </div>
             <div class="detail-item">
-              <span>合约月</span>
+              <span>Month</span>
               <strong id="detail-contract-month">--</strong>
             </div>
             <div class="detail-item">
-              <span>交易乘数</span>
+              <span>Multiplier</span>
               <strong id="detail-volume-multiple">--</strong>
             </div>
           </div>
@@ -150,18 +169,93 @@
         </div>
       </div>
       <div class="panel">
-        <div class="panel-label">指标</div>
+        <div class="panel-label">Studies</div>
         <form id="indicator-form" class="indicator-list"></form>
-        <div class="hint">把自定义指标写进项目根目录的 <code>custom_indicators.py</code>，刷新页面后会自动出现。</div>
+        <div class="hint">`1/2/3` 切换 Orderflow 模式，`C` 锁定价格中心，订单流 pane 内滚轮调整梯子密度。</div>
       </div>
       <div id="error-message" class="error"></div>
     </aside>
     <main class="main">
+      <header class="terminal-toolbar">
+        <div class="toolbar-group">
+          <div class="toolbar-pill toolbar-pill-accent">Profile</div>
+          <label class="toolbar-select-wrap">
+            <span>Provider</span>
+            <select id="toolbar-provider"></select>
+          </label>
+          <label class="toolbar-select-wrap toolbar-select-wrap-wide">
+            <span>Symbol</span>
+            <select id="toolbar-symbol"></select>
+          </label>
+          <label class="toolbar-select-wrap">
+            <span>TF</span>
+            <select id="toolbar-duration"></select>
+          </label>
+          <label class="toolbar-select-wrap">
+            <span>Chart</span>
+            <select id="toolbar-bar-mode"></select>
+          </label>
+          <label class="toolbar-select-wrap">
+            <span>Tick</span>
+            <input id="toolbar-range-ticks" type="number" min="1" step="1" />
+          </label>
+          <label class="toolbar-select-wrap">
+            <span>Bars</span>
+            <input id="toolbar-brick-length" type="number" min="100" step="100" />
+          </label>
+          <label class="toolbar-select-wrap">
+            <span>View</span>
+            <select id="toolbar-orderflow-view">
+              <option value="profile">Profile</option>
+              <option value="overlay">Overlay</option>
+              <option value="ladder">Ladder</option>
+            </select>
+          </label>
+          <label class="toolbar-check-wrap">
+            <input id="toolbar-center-lock" type="checkbox" checked />
+            <span>Center Lock</span>
+          </label>
+        </div>
+        <div class="toolbar-group">
+          <label class="toolbar-toggle"><input id="toggle-cluster" type="checkbox" checked /><span>Cluster</span></label>
+          <label class="toolbar-toggle"><input id="toggle-text" type="checkbox" checked /><span>Text</span></label>
+          <label class="toolbar-toggle"><input id="toggle-candle" type="checkbox" checked /><span>Candle</span></label>
+          <label class="toolbar-toggle"><input id="toggle-oi" type="checkbox" checked /><span>OI</span></label>
+          <label class="toolbar-toggle"><input id="toggle-nl" type="checkbox" checked /><span>NL</span></label>
+          <label class="toolbar-toggle"><input id="toggle-ns" type="checkbox" checked /><span>NS</span></label>
+          <label class="toolbar-toggle"><input id="toggle-vwap" type="checkbox" checked /><span>vWap</span></label>
+        </div>
+        <div class="toolbar-group toolbar-group-end">
+          <button id="toolbar-save-template" class="toolbar-pill toolbar-action" type="button">Save tpl</button>
+          <button id="toolbar-reset-template" class="toolbar-pill toolbar-action" type="button">Default</button>
+        </div>
+      </header>
+      <section class="terminal-meta">
+        <div class="meta-line">
+          <span class="meta-item"><strong id="meta-contract">XAUUSDT</strong></span>
+          <span class="meta-item">O/H/L/C by live feed</span>
+          <span class="meta-item">Trades / Delta / Profile</span>
+          <span class="meta-item" id="meta-status">Realtime cluster terminal</span>
+        </div>
+      </section>
       <div class="canvas-card">
         <div id="chart-stack" class="chart-stack"></div>
       </div>
+      <footer class="terminal-footer">
+        <div class="footer-group">
+          <span class="footer-item">Session</span>
+          <span class="footer-item">Hours</span>
+          <span class="footer-item">X grid</span>
+          <span class="footer-item">Y grid</span>
+          <span class="footer-item footer-item-active">Crosshair</span>
+        </div>
+        <div class="footer-group footer-group-end">
+          <span class="footer-item">Reset</span>
+          <span class="footer-item">Zoom On</span>
+        </div>
+      </footer>
     </main>
   </div>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v=asset_versions.app_js) }}"></script>
 </body>
 </html>
