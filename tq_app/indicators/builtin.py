@@ -93,7 +93,7 @@ class AtrBandsIndicator(Indicator):
         name="ATR Bands",
         pane="price",
         description="基于 ATR 的上下轨，默认参数 N=14, M=1.5。",
-        enabled_by_default=True,
+        enabled_by_default=False,
     )
 
     def __init__(self, period: int = 14, multiplier: float = 1.5) -> None:
@@ -472,7 +472,7 @@ class WebGLOrderflowIndicator(Indicator):
         name="Orderflow GL",
         pane="indicator",
         description="使用 WebGL 渲染的订单流矩阵面板，当前聚合展示 Delta、Imbalance、Microprice、dOI、效率与强度。",
-        enabled_by_default=True,
+        enabled_by_default=False,
         params=[
             {"key": "view_mode", "label": "视图模式", "type": "string", "default": "profile", "options": ["profile", "overlay", "ladder"]},
             {"key": "profile_opacity", "label": "Profile透明度", "type": "float", "default": 0.78, "min": 0.1, "max": 1.0, "step": 0.01},
