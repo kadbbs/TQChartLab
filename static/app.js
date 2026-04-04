@@ -415,12 +415,14 @@ class WebGLOrderflowRenderer {
     this.animationTimerId = null;
     this.needsRender = true;
     this.hoveredRowKey = null;
+    this.hoveredColumn = null;
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.container);
     this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.render());
     this.container.addEventListener("pointermove", (event) => this.handlePointerMove(event));
     this.container.addEventListener("pointerleave", () => {
       this.hoveredRowKey = null;
+      this.hoveredColumn = null;
     });
     this.container.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });
 
@@ -546,9 +548,16 @@ class WebGLOrderflowRenderer {
       return;
     }
     const rect = this.container.getBoundingClientRect();
+    const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
     const row = this.currentScene.rows.find((item) => y >= item.top && y < item.bottom);
     this.hoveredRowKey = row?.key || null;
+    this.hoveredColumn = this.currentScene?.columns?.find((item) => {
+      if (!Number.isFinite(item.centerX)) {
+        return false;
+      }
+      return Math.abs(item.centerX - x) <= 22;
+    }) || null;
     this.requestRender();
   }
 
@@ -726,6 +735,18 @@ class WebGLOrderflowRenderer {
       this.labelCtx.fillText(scene.headerStats.primary, 160, 12);
       this.labelCtx.fillStyle = "rgba(141, 147, 165, 0.82)";
       this.labelCtx.fillText(scene.headerStats.secondary, 160, 28);
+    }
+    if (this.hoveredColumn) {
+      const hoverText1 = `T ${this.hoveredColumn.label}  POC ${this.hoveredColumn.pocPriceLabel || "--"}  VAH ${this.hoveredColumn.valueAreaLabels?.vah || "--"}  VAL ${this.hoveredColumn.valueAreaLabels?.val || "--"}`;
+      const hoverText2 = `Vol ${Math.round(this.hoveredColumn.clusterVolume || 0)}  Δ ${Number(this.hoveredColumn.clusterDelta || 0).toFixed(2)}  CVD ${Number(this.hoveredColumn.clusterCvd || 0).toFixed(2)}`;
+      this.labelCtx.fillStyle = "rgba(20, 21, 27, 0.94)";
+      this.labelCtx.fillRect(width - 364, 42, 348, 42);
+      this.labelCtx.strokeStyle = "rgba(133, 137, 153, 0.22)";
+      this.labelCtx.strokeRect(width - 364, 42, 348, 42);
+      this.labelCtx.fillStyle = "rgba(225, 229, 236, 0.92)";
+      this.labelCtx.fillText(hoverText1, width - 356, 54);
+      this.labelCtx.fillStyle = "rgba(141, 147, 165, 0.9)";
+      this.labelCtx.fillText(hoverText2, width - 356, 72);
     }
   }
 
@@ -1351,6 +1372,8 @@ class WebGLOrderflowRenderer {
       let maxTotal = 0;
       let pocPrice = null;
       let pocTotal = -1;
+      let clusterVolume = 0;
+      let clusterDelta = 0;
       rows.forEach((row) => {
         const level = levels.get(row.key);
         const total = Number(level?.total || 0);
@@ -1361,6 +1384,8 @@ class WebGLOrderflowRenderer {
           pocTotal = total;
           pocPrice = row.price;
         }
+        clusterVolume += total;
+        clusterDelta += Number(level?.buy || 0) - Number(level?.sell || 0);
       });
       const valueAreaTarget = [...levels.values()].reduce((sum, level) => sum + Number(level?.total || 0), 0) * 0.7;
       const ranked = rows
@@ -1479,6 +1504,9 @@ class WebGLOrderflowRenderer {
       }
 
       column.centerX = centerX;
+      column.clusterVolume = clusterVolume;
+      column.clusterDelta = clusterDelta;
+      column.clusterCvd = clusterDelta;
     });
 
     const spreadTicks = Number.isFinite(bestBid) && Number.isFinite(bestAsk) && priceTick > 0
@@ -1736,6 +1764,11 @@ class TerminalStatsRenderer {
     this.ctx.font = "11px IBM Plex Mono, IBM Plex Sans, monospace";
     this.ctx.fillStyle = "rgba(141, 147, 165, 0.82)";
     this.ctx.fillText("Footprint bar statistics", 8, 11);
+    this.ctx.fillStyle = "rgba(141, 147, 165, 0.7)";
+    this.ctx.fillText("Volume", 140, 11);
+    this.ctx.fillText("Delta", 260, 11);
+    this.ctx.fillText("dOI", 370, 11);
+    this.ctx.fillText("CVD", 470, 11);
     rows.forEach((row, rowIndex) => {
       const top = headerHeight + rowIndex * rowHeight;
       this.ctx.fillStyle = rowIndex % 2 === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.05)";
@@ -1764,6 +1797,12 @@ class TerminalStatsRenderer {
         this.ctx.fillStyle = "rgba(236,240,245,0.88)";
         this.ctx.fillText(row.format ? row.format(value) : `${value}`, x - columnWidth / 2 + 3, top + rowHeight / 2 + 3);
         if (point.time === latestTime) {
+          this.ctx.fillStyle = "rgba(255,255,255,0.04)";
+          this.ctx.fillRect(x - columnWidth / 2 - 2, top - 1, columnWidth + 4, rowHeight - 2);
+          this.ctx.fillStyle = color.replace("0.85", String(0.22 + alpha * 0.72));
+          this.ctx.fillRect(x - columnWidth / 2, top, columnWidth, rowHeight - 4);
+          this.ctx.fillStyle = "rgba(236,240,245,0.96)";
+          this.ctx.fillText(row.format ? row.format(value) : `${value}`, x - columnWidth / 2 + 3, top + rowHeight / 2 + 3);
           this.ctx.strokeStyle = "rgba(255,255,255,0.18)";
           this.ctx.strokeRect(x - columnWidth / 2, top, columnWidth, rowHeight - 4);
         }

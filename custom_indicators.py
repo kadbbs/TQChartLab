@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import numpy as np
 import pandas as pd
 
 from tq_app.indicators import Indicator
 from tq_app.models import IndicatorMeta, IndicatorResult, SeriesDefinition
+from tq_app.data_sources.bitget import GRANULARITY_MAP, DEFAULT_PRODUCT_TYPES, _bitget_get_json
 
 
 def _line_point(time_value: int, value: float | None) -> dict[str, float | int]:
@@ -103,6 +105,89 @@ def _trend_line_data(
         points.append(_line_point(int(row.time), value if trend is bullish else None))
 
     return points
+
+
+def _value_line_data(times: list[int], values: list[float | None]) -> list[dict[str, float | int | None]]:
+    return [_line_point(int(time_value), value) for time_value, value in zip(times, values)]
+
+
+def _marker(time_value: int, position: str, color: str, text: str, shape: str = "circle") -> dict[str, str | int]:
+    return {
+        "time": int(time_value),
+        "position": position,
+        "color": color,
+        "shape": shape,
+        "size": 1,
+        "text": text,
+    }
+
+
+def _infer_duration_seconds(df: pd.DataFrame) -> int:
+    if "datetime" not in df.columns or len(df) < 2:
+        return 60
+    dt_series = pd.to_datetime(df["datetime"])
+    diffs = dt_series.diff().dropna().dt.total_seconds()
+    if diffs.empty:
+        return 60
+    median = diffs.median()
+    if not np.isfinite(median) or median <= 0:
+        return 60
+    return int(median)
+
+
+def _fetch_bitget_compare_bars(symbol: str, duration_seconds: int, data_length: int) -> pd.DataFrame:
+    granularity = GRANULARITY_MAP.get(duration_seconds)
+    if granularity is None:
+        return pd.DataFrame(columns=["datetime", "high", "low", "close"])
+
+    product_type = (os.getenv("BITGET_DEFAULT_PRODUCT_TYPE", "").strip().upper() or DEFAULT_PRODUCT_TYPES[0])
+    remaining = max(int(data_length), 1)
+    end_time = None
+    rows: list[list[object]] = []
+    seen: set[int] = set()
+
+    while remaining > 0:
+        limit = min(remaining, 200)
+        payload = _bitget_get_json(
+            "/api/v2/mix/market/history-candles",
+            {
+                "symbol": symbol,
+                "productType": product_type,
+                "granularity": granularity,
+                "endTime": str(end_time) if end_time is not None else None,
+                "limit": str(limit),
+            },
+        )
+        batch = payload.get("data", []) if isinstance(payload, dict) else []
+        if not batch:
+            break
+        oldest = None
+        for item in batch:
+            if not item or len(item) < 5:
+                continue
+            ts = int(item[0])
+            if ts in seen:
+                continue
+            seen.add(ts)
+            rows.append(item)
+            oldest = ts if oldest is None else min(oldest, ts)
+        if oldest is None:
+            break
+        end_time = oldest - 1
+        remaining = data_length - len(rows)
+        if len(batch) < limit:
+            break
+
+    if not rows:
+        return pd.DataFrame(columns=["datetime", "high", "low", "close"])
+
+    frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "quote_volume"])
+    frame["datetime"] = pd.to_datetime(frame["timestamp"].astype("int64"), unit="ms")
+    for column in ["high", "low", "close"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["high", "low", "close"])
+    frame = frame.sort_values("datetime").drop_duplicates(subset=["datetime"]).tail(data_length).reset_index(drop=True)
+    return frame[["datetime", "high", "low", "close"]]
 
 def _wma(series: pd.Series, period: int) -> pd.Series:
     safe_period = max(int(period), 1)
@@ -1170,6 +1255,578 @@ class ChopBreakoutStartIndicator(Indicator):
         )
 
 
+class IctConceptsLiteIndicator(Indicator):
+    meta = IndicatorMeta(
+        id="ict_concepts_lite",
+        name="ICT Concepts Lite",
+        pane="price",
+        description="当前项目可用版 ICT Concepts，包含 BOS/MSS、OB、FVG/BPR/CE、流动性扫单与 Fib 关键位。",
+        enabled_by_default=False,
+        params=[
+            {"key": "pivot_len", "label": "结构 Pivot", "type": "int", "default": 5, "min": 1, "step": 1},
+            {"key": "show_structure", "label": "显示结构", "type": "bool", "default": True},
+            {"key": "show_order_blocks", "label": "显示 OB", "type": "bool", "default": True},
+            {"key": "ob_limit", "label": "OB 数量", "type": "int", "default": 2, "min": 1, "max": 4, "step": 1},
+            {"key": "show_mid", "label": "显示 OB 50%", "type": "bool", "default": True},
+            {"key": "imbalance_type", "label": "失衡类型", "type": "string", "default": "FVG", "options": ["FVG", "BPR", "CE"]},
+            {"key": "fvg_limit", "label": "FVG 数量", "type": "int", "default": 3, "min": 1, "max": 5, "step": 1},
+            {"key": "show_liquidity", "label": "显示流动性扫单", "type": "bool", "default": True},
+            {"key": "liq_pivot_len", "label": "流动性 Pivot", "type": "int", "default": 20, "min": 3, "step": 1},
+            {"key": "show_smt", "label": "显示 SMT", "type": "bool", "default": False},
+            {"key": "smt_symbol", "label": "SMT 对比品种", "type": "string", "default": "ETHUSDT"},
+            {"key": "smt_pivot_len", "label": "SMT Pivot", "type": "int", "default": 5, "min": 1, "step": 1},
+            {"key": "show_fib", "label": "显示 Fib", "type": "bool", "default": True},
+            {"key": "fib_eq", "label": "EQ", "type": "float", "default": 0.5, "step": 0.001},
+            {"key": "fib_ote_low", "label": "OTE Low", "type": "float", "default": 0.618, "step": 0.001},
+            {"key": "fib_ote_mid", "label": "OTE Mid", "type": "float", "default": 0.705, "step": 0.001},
+            {"key": "fib_ote_high", "label": "OTE High", "type": "float", "default": 0.79, "step": 0.001},
+            {"key": "show_killzones", "label": "显示 Killzones", "type": "bool", "default": False},
+            {"key": "show_kz_asian", "label": "Asian KZ", "type": "bool", "default": False},
+            {"key": "show_kz_london", "label": "London Open KZ", "type": "bool", "default": False},
+            {"key": "show_kz_nyam", "label": "NY AM KZ", "type": "bool", "default": False},
+            {"key": "show_kz_nypm", "label": "NY PM KZ", "type": "bool", "default": False},
+        ],
+    )
+
+    def build(self, bars: pd.DataFrame, params: dict | None = None) -> IndicatorResult:
+        resolved = self.resolve_params(params)
+        pivot_len = resolved["pivot_len"]
+        show_structure = resolved["show_structure"]
+        show_order_blocks = resolved["show_order_blocks"]
+        ob_limit = resolved["ob_limit"]
+        show_mid = resolved["show_mid"]
+        imbalance_type = resolved["imbalance_type"]
+        fvg_limit = resolved["fvg_limit"]
+        show_liquidity = resolved["show_liquidity"]
+        liq_pivot_len = resolved["liq_pivot_len"]
+        show_smt = resolved["show_smt"]
+        smt_symbol = resolved["smt_symbol"]
+        smt_pivot_len = resolved["smt_pivot_len"]
+        show_fib = resolved["show_fib"]
+        fib_eq = resolved["fib_eq"]
+        fib_ote_low = resolved["fib_ote_low"]
+        fib_ote_mid = resolved["fib_ote_mid"]
+        fib_ote_high = resolved["fib_ote_high"]
+        show_killzones = resolved["show_killzones"]
+        show_kz_asian = resolved["show_kz_asian"]
+        show_kz_london = resolved["show_kz_london"]
+        show_kz_nyam = resolved["show_kz_nyam"]
+        show_kz_nypm = resolved["show_kz_nypm"]
+
+        df = bars.copy().reset_index(drop=True)
+        times = df["time"].astype(int).tolist()
+        opens = pd.to_numeric(df["open"], errors="coerce").tolist()
+        highs = pd.to_numeric(df["high"], errors="coerce").tolist()
+        lows = pd.to_numeric(df["low"], errors="coerce").tolist()
+        closes = pd.to_numeric(df["close"], errors="coerce").tolist()
+        datetimes = pd.to_datetime(df["datetime"]) if "datetime" in df.columns else pd.Series(pd.NaT, index=df.index)
+        duration_seconds = _infer_duration_seconds(df)
+
+        pivot_high_values: list[float | None] = [None] * len(df)
+        pivot_low_values: list[float | None] = [None] * len(df)
+        for idx in range(pivot_len, len(df) - pivot_len):
+            window_highs = highs[idx - pivot_len : idx + pivot_len + 1]
+            window_lows = lows[idx - pivot_len : idx + pivot_len + 1]
+            if all(np.isfinite(window_highs)) and highs[idx] == max(window_highs):
+                pivot_high_values[idx] = highs[idx]
+            if all(np.isfinite(window_lows)) and lows[idx] == min(window_lows):
+                pivot_low_values[idx] = lows[idx]
+
+        structure_markers: list[dict[str, str | int]] = []
+        liquidity_markers: list[dict[str, str | int]] = []
+        last_high = np.nan
+        last_low = np.nan
+        last_high_index = -1
+        last_low_index = -1
+        trend_bull = False
+        trend_initialized = False
+        last_high_broken = False
+        last_low_broken = False
+        last_break_dir = 0
+        last_break_extreme = np.nan
+        last_opp_price = np.nan
+        last_opp_index = -1
+
+        bull_obs: list[dict[str, float | int | bool]] = []
+        bear_obs: list[dict[str, float | int | bool]] = []
+        bull_fvgs: list[dict[str, float | int | bool]] = []
+        bear_fvgs: list[dict[str, float | int | bool]] = []
+        bull_ob_top = [[None] * len(df) for _ in range(ob_limit)]
+        bull_ob_bottom = [[None] * len(df) for _ in range(ob_limit)]
+        bull_ob_mid = [[None] * len(df) for _ in range(ob_limit)]
+        bear_ob_top = [[None] * len(df) for _ in range(ob_limit)]
+        bear_ob_bottom = [[None] * len(df) for _ in range(ob_limit)]
+        bear_ob_mid = [[None] * len(df) for _ in range(ob_limit)]
+        bull_fvg_top = [[None] * len(df) for _ in range(fvg_limit)]
+        bull_fvg_bottom = [[None] * len(df) for _ in range(fvg_limit)]
+        bull_fvg_mid = [[None] * len(df) for _ in range(fvg_limit)]
+        bear_fvg_top = [[None] * len(df) for _ in range(fvg_limit)]
+        bear_fvg_bottom = [[None] * len(df) for _ in range(fvg_limit)]
+        bear_fvg_mid = [[None] * len(df) for _ in range(fvg_limit)]
+        fib_eq_values: list[float | None] = [None] * len(df)
+        fib_ote_low_values: list[float | None] = [None] * len(df)
+        fib_ote_mid_values: list[float | None] = [None] * len(df)
+        fib_ote_high_values: list[float | None] = [None] * len(df)
+        liq_high = np.nan
+        liq_low = np.nan
+        liq_high_swept = False
+        liq_low_swept = False
+
+        smt_markers: list[dict[str, str | int]] = []
+        if show_smt and smt_symbol:
+            compare_frame = _fetch_bitget_compare_bars(smt_symbol, duration_seconds, len(df) + smt_pivot_len * 4)
+            if not compare_frame.empty:
+                compare_frame["datetime"] = pd.to_datetime(compare_frame["datetime"])
+                merged = df[["datetime", "high", "low"]].merge(compare_frame, on="datetime", how="left", suffixes=("_main", "_compare"))
+                main_highs = pd.to_numeric(merged["high_main"], errors="coerce").tolist()
+                main_lows = pd.to_numeric(merged["low_main"], errors="coerce").tolist()
+                cmp_highs = pd.to_numeric(merged["high_compare"], errors="coerce").tolist()
+                cmp_lows = pd.to_numeric(merged["low_compare"], errors="coerce").tolist()
+                last_main_high = np.nan
+                prev_main_high = np.nan
+                last_cmp_high = np.nan
+                prev_cmp_high = np.nan
+                last_main_low = np.nan
+                prev_main_low = np.nan
+                last_cmp_low = np.nan
+                prev_cmp_low = np.nan
+
+                for idx in range(smt_pivot_len, len(df) - smt_pivot_len):
+                    high_window = main_highs[idx - smt_pivot_len : idx + smt_pivot_len + 1]
+                    low_window = main_lows[idx - smt_pivot_len : idx + smt_pivot_len + 1]
+                    cmp_high_window = cmp_highs[idx - smt_pivot_len : idx + smt_pivot_len + 1]
+                    cmp_low_window = cmp_lows[idx - smt_pivot_len : idx + smt_pivot_len + 1]
+
+                    if all(np.isfinite(high_window)) and np.isfinite(main_highs[idx]) and main_highs[idx] == max(high_window):
+                        prev_main_high = last_main_high
+                        last_main_high = main_highs[idx]
+                        if all(np.isfinite(cmp_high_window)) and np.isfinite(cmp_highs[idx]) and cmp_highs[idx] == max(cmp_high_window):
+                            prev_cmp_high = last_cmp_high
+                            last_cmp_high = cmp_highs[idx]
+                        if np.isfinite(prev_main_high) and np.isfinite(prev_cmp_high) and np.isfinite(last_cmp_high):
+                            if last_main_high > prev_main_high and last_cmp_high <= prev_cmp_high:
+                                smt_markers.append(_marker(times[idx], "aboveBar", "#ff5c7a", "SMT▼", "arrowDown"))
+
+                    if all(np.isfinite(low_window)) and np.isfinite(main_lows[idx]) and main_lows[idx] == min(low_window):
+                        prev_main_low = last_main_low
+                        last_main_low = main_lows[idx]
+                        if all(np.isfinite(cmp_low_window)) and np.isfinite(cmp_lows[idx]) and cmp_lows[idx] == min(cmp_low_window):
+                            prev_cmp_low = last_cmp_low
+                            last_cmp_low = cmp_lows[idx]
+                        if np.isfinite(prev_main_low) and np.isfinite(prev_cmp_low) and np.isfinite(last_cmp_low):
+                            if last_main_low < prev_main_low and last_cmp_low >= prev_cmp_low:
+                                smt_markers.append(_marker(times[idx], "belowBar", "#5cc8ff", "SMT▲", "arrowUp"))
+
+        killzone_series: list[SeriesDefinition] = []
+        if show_killzones and not datetimes.isna().all():
+            session_specs = [
+                ("asian", show_kz_asian, (20, 0), (0, 0), "rgba(57, 100, 176, 0.10)", "rgba(57, 100, 176, 0.35)"),
+                ("london", show_kz_london, (2, 0), (5, 0), "rgba(50, 215, 75, 0.10)", "rgba(50, 215, 75, 0.35)"),
+                ("nyam", show_kz_nyam, (8, 30), (11, 0), "rgba(255, 77, 79, 0.10)", "rgba(255, 77, 79, 0.35)"),
+                ("nypm", show_kz_nypm, (13, 30), (16, 0), "rgba(245, 158, 11, 0.10)", "rgba(245, 158, 11, 0.35)"),
+            ]
+            session_times = datetimes.dt.tz_localize("UTC").dt.tz_convert("Etc/GMT+5")
+            for session_id, enabled, start_hm, end_hm, fill_color, line_color in session_specs:
+                if not enabled:
+                    continue
+                top_values: list[float | None] = [None] * len(df)
+                bottom_values: list[float | None] = [None] * len(df)
+                active_top = np.nan
+                active_bottom = np.nan
+                active = False
+                for idx in range(len(df)):
+                    dt = session_times.iloc[idx]
+                    hour_min = (dt.hour, dt.minute)
+                    in_session = False
+                    if session_id == "asian":
+                        in_session = hour_min >= start_hm or hour_min < end_hm
+                    else:
+                        in_session = start_hm <= hour_min < end_hm
+                    if in_session:
+                        active_top = highs[idx] if not active or not np.isfinite(active_top) else max(active_top, highs[idx])
+                        active_bottom = lows[idx] if not active or not np.isfinite(active_bottom) else min(active_bottom, lows[idx])
+                        active = True
+                    else:
+                        active = False
+                        active_top = np.nan
+                        active_bottom = np.nan
+                    top_values[idx] = active_top if np.isfinite(active_top) else None
+                    bottom_values[idx] = active_bottom if np.isfinite(active_bottom) else None
+
+                killzone_series.extend(
+                    [
+                        SeriesDefinition(
+                            id=f"ict_kz_{session_id}_top",
+                            name=f"{session_id.upper()} Top",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, top_values),
+                            options={
+                                "color": line_color,
+                                "lineWidth": 1,
+                                "priceLineVisible": False,
+                                "lastValueVisible": False,
+                                "fillToSeriesId": f"ict_kz_{session_id}_bottom",
+                                "fillColor": fill_color,
+                            },
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_kz_{session_id}_bottom",
+                            name=f"{session_id.upper()} Bottom",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bottom_values),
+                            options={"color": line_color, "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                        ),
+                    ]
+                )
+
+        for idx in range(len(df)):
+            current_close = closes[idx]
+            current_high = highs[idx]
+            current_low = lows[idx]
+
+            pivot_high = pivot_high_values[idx]
+            pivot_low = pivot_low_values[idx]
+            if pivot_high is not None:
+                last_high = pivot_high
+                last_high_index = idx
+                last_high_broken = False
+                liq_high = pivot_high
+                liq_high_swept = False
+            if pivot_low is not None:
+                last_low = pivot_low
+                last_low_index = idx
+                last_low_broken = False
+                liq_low = pivot_low
+                liq_low_swept = False
+
+            if np.isfinite(last_high) and current_close > last_high and not last_high_broken:
+                structure_markers.append(
+                    _marker(times[idx], "aboveBar", "#69ff7b", "BOS" if (not trend_initialized or trend_bull) else "MSS")
+                )
+                trend_bull = True
+                trend_initialized = True
+                last_high_broken = True
+                last_break_dir = 1
+                last_break_extreme = current_high
+                last_opp_price = last_low
+                last_opp_index = last_low_index
+
+            if np.isfinite(last_low) and current_close < last_low and not last_low_broken:
+                structure_markers.append(
+                    _marker(times[idx], "belowBar", "#ff335f", "BOS" if (not trend_initialized or not trend_bull) else "MSS")
+                )
+                trend_bull = False
+                trend_initialized = True
+                last_low_broken = True
+                last_break_dir = -1
+                last_break_extreme = current_low
+                last_opp_price = last_high
+                last_opp_index = last_high_index
+
+            if last_break_dir == 1 and np.isfinite(last_break_extreme):
+                last_break_extreme = max(last_break_extreme, current_high)
+            if last_break_dir == -1 and np.isfinite(last_break_extreme):
+                last_break_extreme = min(last_break_extreme, current_low)
+
+            if idx >= 2:
+                is_bull_ob = (
+                    opens[idx - 2] > closes[idx - 2]
+                    and closes[idx - 1] > opens[idx - 1]
+                    and closes[idx] > opens[idx]
+                    and lows[idx - 1] < lows[idx - 2]
+                    and closes[idx] > highs[idx - 1]
+                )
+                is_bear_ob = (
+                    opens[idx - 2] < closes[idx - 2]
+                    and closes[idx - 1] < opens[idx - 1]
+                    and closes[idx] < opens[idx]
+                    and highs[idx - 1] > highs[idx - 2]
+                    and closes[idx] < lows[idx - 1]
+                )
+                if is_bull_ob:
+                    bull_obs.append(
+                        {"top": highs[idx - 1], "bottom": lows[idx - 1], "start": idx - 1, "mid": (highs[idx - 1] + lows[idx - 1]) / 2}
+                    )
+                if is_bear_ob:
+                    bear_obs.append(
+                        {"top": highs[idx - 1], "bottom": lows[idx - 1], "start": idx - 1, "mid": (highs[idx - 1] + lows[idx - 1]) / 2}
+                    )
+
+                bull_fvg_detected = lows[idx] > highs[idx - 2]
+                bear_fvg_detected = highs[idx] < lows[idx - 2]
+                if bull_fvg_detected:
+                    bull_fvgs.append(
+                        {"top": lows[idx], "bottom": highs[idx - 2], "start": idx, "mid": (lows[idx] + highs[idx - 2]) / 2}
+                    )
+                if bear_fvg_detected:
+                    bear_fvgs.append(
+                        {"top": lows[idx - 2], "bottom": highs[idx], "start": idx, "mid": (lows[idx - 2] + highs[idx]) / 2}
+                    )
+
+            bull_obs = [item for item in bull_obs if current_close >= float(item["bottom"])]
+            bear_obs = [item for item in bear_obs if current_close <= float(item["top"])]
+            bull_fvgs = [item for item in bull_fvgs if current_low >= float(item["bottom"])]
+            bear_fvgs = [item for item in bear_fvgs if current_high <= float(item["top"])]
+
+            for slot, item in enumerate(bull_obs[-ob_limit:]):
+                bull_ob_top[slot][idx] = float(item["top"])
+                bull_ob_bottom[slot][idx] = float(item["bottom"])
+                bull_ob_mid[slot][idx] = float(item["mid"])
+            for slot, item in enumerate(bear_obs[-ob_limit:]):
+                bear_ob_top[slot][idx] = float(item["top"])
+                bear_ob_bottom[slot][idx] = float(item["bottom"])
+                bear_ob_mid[slot][idx] = float(item["mid"])
+
+            display_bull_fvgs = bull_fvgs[-fvg_limit:]
+            display_bear_fvgs = bear_fvgs[-fvg_limit:]
+            if imbalance_type == "BPR":
+                display_bull_fvgs = []
+                display_bear_fvgs = []
+                for bull in bull_fvgs[-10:]:
+                    for bear in bear_fvgs[-10:]:
+                        overlap_top = min(float(bull["top"]), float(bear["top"]))
+                        overlap_bottom = max(float(bull["bottom"]), float(bear["bottom"]))
+                        if overlap_top > overlap_bottom:
+                            display_bull_fvgs.append(
+                                {"top": overlap_top, "bottom": overlap_bottom, "mid": (overlap_top + overlap_bottom) / 2, "start": idx}
+                            )
+                display_bull_fvgs = display_bull_fvgs[-fvg_limit:]
+                display_bear_fvgs = []
+
+            for slot, item in enumerate(display_bull_fvgs):
+                bull_fvg_top[slot][idx] = float(item["top"])
+                bull_fvg_bottom[slot][idx] = float(item["bottom"])
+                bull_fvg_mid[slot][idx] = float(item["mid"])
+            for slot, item in enumerate(display_bear_fvgs):
+                bear_fvg_top[slot][idx] = float(item["top"])
+                bear_fvg_bottom[slot][idx] = float(item["bottom"])
+                bear_fvg_mid[slot][idx] = float(item["mid"])
+
+            if show_liquidity and np.isfinite(liq_low) and not liq_low_swept and current_low < liq_low and current_close > liq_low:
+                liquidity_markers.append(_marker(times[idx], "belowBar", "#59a6ff", "SSL", "arrowUp"))
+                liq_low_swept = True
+            if show_liquidity and np.isfinite(liq_high) and not liq_high_swept and current_high > liq_high and current_close < liq_high:
+                liquidity_markers.append(_marker(times[idx], "aboveBar", "#d973ff", "BSL", "arrowDown"))
+                liq_high_swept = True
+
+            if show_fib and last_break_dir != 0 and np.isfinite(last_break_extreme) and np.isfinite(last_opp_price):
+                base = last_break_extreme
+                span = last_opp_price - base
+                fib_eq_values[idx] = base + span * fib_eq
+                fib_ote_low_values[idx] = base + span * fib_ote_low
+                fib_ote_mid_values[idx] = base + span * fib_ote_mid
+                fib_ote_high_values[idx] = base + span * fib_ote_high
+
+        markers = structure_markers + liquidity_markers + smt_markers
+        series: list[SeriesDefinition] = []
+
+        if show_structure:
+            series.append(
+                SeriesDefinition(
+                    id="ict_concepts_structure_anchor",
+                    name="ICT Structure",
+                    pane="price",
+                    series_type="line",
+                    data=_value_line_data(times, closes),
+                    options={
+                        "color": "rgba(0,0,0,0)",
+                        "lineWidth": 1,
+                        "priceLineVisible": False,
+                        "lastValueVisible": False,
+                        "markers": markers,
+                    },
+                )
+            )
+
+        if show_order_blocks:
+            for slot in range(ob_limit):
+                series.extend(
+                    [
+                        SeriesDefinition(
+                            id=f"ict_bull_ob_top_{slot}",
+                            name=f"Bull OB {slot + 1} Top",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bull_ob_top[slot]),
+                            options={
+                                "color": "#0bd6a3",
+                                "lineWidth": 1,
+                                "priceLineVisible": False,
+                                "lastValueVisible": False,
+                                "fillToSeriesId": f"ict_bull_ob_bottom_{slot}",
+                                "fillColor": "rgba(11, 214, 163, 0.12)",
+                            },
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bull_ob_bottom_{slot}",
+                            name=f"Bull OB {slot + 1} Bottom",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bull_ob_bottom[slot]),
+                            options={"color": "#0bd6a3", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bear_ob_top_{slot}",
+                            name=f"Bear OB {slot + 1} Top",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bear_ob_top[slot]),
+                            options={
+                                "color": "#dd326b",
+                                "lineWidth": 1,
+                                "priceLineVisible": False,
+                                "lastValueVisible": False,
+                                "fillToSeriesId": f"ict_bear_ob_bottom_{slot}",
+                                "fillColor": "rgba(221, 50, 107, 0.12)",
+                            },
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bear_ob_bottom_{slot}",
+                            name=f"Bear OB {slot + 1} Bottom",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bear_ob_bottom[slot]),
+                            options={"color": "#dd326b", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                        ),
+                    ]
+                )
+                if show_mid:
+                    series.extend(
+                        [
+                            SeriesDefinition(
+                                id=f"ict_bull_ob_mid_{slot}",
+                                name=f"Bull OB {slot + 1} Mid",
+                                pane="price",
+                                series_type="line",
+                                data=_value_line_data(times, bull_ob_mid[slot]),
+                                options={"color": "rgba(11, 214, 163, 0.55)", "lineWidth": 1, "lineStyle": 2, "priceLineVisible": False, "lastValueVisible": False},
+                            ),
+                            SeriesDefinition(
+                                id=f"ict_bear_ob_mid_{slot}",
+                                name=f"Bear OB {slot + 1} Mid",
+                                pane="price",
+                                series_type="line",
+                                data=_value_line_data(times, bear_ob_mid[slot]),
+                                options={"color": "rgba(221, 50, 107, 0.55)", "lineWidth": 1, "lineStyle": 2, "priceLineVisible": False, "lastValueVisible": False},
+                            ),
+                        ]
+                    )
+
+        if imbalance_type in {"FVG", "BPR", "CE"}:
+            for slot in range(fvg_limit):
+                series.extend(
+                    [
+                        SeriesDefinition(
+                            id=f"ict_bull_fvg_top_{slot}",
+                            name=f"Bull {imbalance_type} {slot + 1} Top",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bull_fvg_top[slot] if imbalance_type != "CE" else bull_fvg_mid[slot]),
+                            options={
+                                "color": "#32d74b",
+                                "lineWidth": 1,
+                                "priceLineVisible": False,
+                                "lastValueVisible": False,
+                                **(
+                                    {
+                                        "fillToSeriesId": f"ict_bull_fvg_bottom_{slot}",
+                                        "fillColor": "rgba(50, 215, 75, 0.10)",
+                                    }
+                                    if imbalance_type != "CE"
+                                    else {}
+                                ),
+                            },
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bull_fvg_bottom_{slot}",
+                            name=f"Bull {imbalance_type} {slot + 1} Bottom",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bull_fvg_bottom[slot]),
+                            options={"color": "#32d74b", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bear_fvg_top_{slot}",
+                            name=f"Bear {imbalance_type} {slot + 1} Top",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bear_fvg_top[slot] if imbalance_type != "CE" else bear_fvg_mid[slot]),
+                            options={
+                                "color": "#ff4d4f",
+                                "lineWidth": 1,
+                                "priceLineVisible": False,
+                                "lastValueVisible": False,
+                                **(
+                                    {
+                                        "fillToSeriesId": f"ict_bear_fvg_bottom_{slot}",
+                                        "fillColor": "rgba(255, 77, 79, 0.10)",
+                                    }
+                                    if imbalance_type != "CE"
+                                    else {}
+                                ),
+                            },
+                        ),
+                        SeriesDefinition(
+                            id=f"ict_bear_fvg_bottom_{slot}",
+                            name=f"Bear {imbalance_type} {slot + 1} Bottom",
+                            pane="price",
+                            series_type="line",
+                            data=_value_line_data(times, bear_fvg_bottom[slot]),
+                            options={"color": "#ff4d4f", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                        ),
+                    ]
+                )
+
+        if show_fib:
+            series.extend(
+                [
+                    SeriesDefinition(
+                        id="ict_fib_eq",
+                        name="Fib EQ",
+                        pane="price",
+                        series_type="line",
+                        data=_value_line_data(times, fib_eq_values),
+                        options={"color": "#aab2c5", "lineWidth": 1, "lineStyle": 2, "priceLineVisible": False, "lastValueVisible": False},
+                    ),
+                    SeriesDefinition(
+                        id="ict_fib_ote_low",
+                        name="Fib OTE Low",
+                        pane="price",
+                        series_type="line",
+                        data=_value_line_data(times, fib_ote_low_values),
+                        options={"color": "#00c853", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                    ),
+                    SeriesDefinition(
+                        id="ict_fib_ote_mid",
+                        name="Fib OTE Mid",
+                        pane="price",
+                        series_type="line",
+                        data=_value_line_data(times, fib_ote_mid_values),
+                        options={"color": "#0bd6a3", "lineWidth": 1, "lineStyle": 2, "priceLineVisible": False, "lastValueVisible": False},
+                    ),
+                    SeriesDefinition(
+                        id="ict_fib_ote_high",
+                        name="Fib OTE High",
+                        pane="price",
+                        series_type="line",
+                        data=_value_line_data(times, fib_ote_high_values),
+                        options={"color": "#00c853", "lineWidth": 1, "priceLineVisible": False, "lastValueVisible": False},
+                    ),
+                ]
+            )
+
+        series.extend(killzone_series)
+
+        return IndicatorResult(
+            id=self.meta.id,
+            name=self.meta.name,
+            pane=self.meta.pane,
+            series=series,
+        )
+
+
 def register_indicators(registry) -> None:
     registry.register(Ema55Indicator())
     registry.register(StcIndicator())
@@ -1178,3 +1835,4 @@ def register_indicators(registry) -> None:
     registry.register(OpenPermissionFilterIndicator())
     registry.register(BreakoutCaptureIndicator())
     registry.register(ChopBreakoutStartIndicator())
+    registry.register(IctConceptsLiteIndicator())
