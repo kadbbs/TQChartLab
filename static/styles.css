@@ -18,6 +18,7 @@
 body {
   margin: 0;
   min-height: 100vh;
+  overflow: hidden;
   background: linear-gradient(180deg, #0b0d11 0%, var(--bg) 42%, #10141c 100%);
   color: var(--text);
   font-family: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -26,13 +27,15 @@ body {
 .shell {
   display: grid;
   grid-template-columns: 320px 1fr;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
   padding: 20px 18px;
   border-right: 1px solid var(--line);
   background: rgba(15, 17, 22, 0.94);
+  overflow: auto;
 }
 
 .brand h1 {
@@ -242,14 +245,57 @@ body {
 
 .main {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 .page-header {
   padding: 12px 16px;
   border-bottom: 1px solid var(--line);
   background: rgba(21, 25, 34, 0.96);
+}
+
+.bar-stats-card {
+  padding: 10px 16px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(17, 21, 29, 0.98);
+}
+
+.bar-stats-title {
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.bar-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.bar-stat {
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(255,255,255,0.03);
+}
+
+.bar-stat span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.bar-stat strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 15px;
 }
 
 .meta-line {
@@ -265,8 +311,10 @@ body {
 }
 
 .chart-card {
+  min-height: 0;
   padding: 10px 10px 0;
   background: #11151d;
+  overflow: hidden;
 }
 
 .chart-stack {
@@ -274,6 +322,7 @@ body {
   flex-direction: column;
   gap: 4px;
   height: 100%;
+  min-height: 0;
 }
 
 .chart-pane {
@@ -326,6 +375,7 @@ body {
 @media (max-width: 960px) {
   .shell {
     grid-template-columns: 1fr;
+    height: 100vh;
   }
 
   .sidebar {
@@ -338,6 +388,10 @@ body {
   }
 
   .main {
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .bar-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

@@ -1812,9 +1812,9 @@ class TerminalStatsRenderer {
       this.ctx.lineTo(column.x + column.columnWidth / 2, height);
       this.ctx.stroke();
     });
-    columns.forEach(({ point, x, columnWidth }) => {
+    columns.forEach(({ point, x, columnWidth, computed }) => {
       rows.forEach((row, rowIndex) => {
-        const value = Number(column.computed?.[row.key] || 0);
+        const value = Number(computed?.[row.key] || 0);
         const top = headerHeight + rowIndex * rowHeight + 2;
         const color = row.color || (value >= 0 ? "rgba(111, 142, 207, 0.85)" : "rgba(213, 56, 71, 0.85)");
         const alpha = Math.min(Math.abs(value) / (row.scale || 1), 1);
@@ -1844,62 +1844,155 @@ class TerminalStatsRenderer {
   }
 
   computeBarStats(point) {
-    const time = Number(point?.time);
-    const open = Number(point?.open);
-    const high = Number(point?.high);
-    const low = Number(point?.low);
-    const close = Number(point?.close);
-    if (![time, open, high, low, close].every(Number.isFinite)) {
-      return {};
-    }
-    const actualTimeMs = this.marketContext?.syntheticToActualTime?.get(time) ?? time * 1000;
-    const bucket = this.marketContext?.tradeBuckets?.get(String(actualTimeMs));
-    if (!bucket) {
-      return {
-        delta: 0,
-        speed: 0,
-        efficiency: 0,
-        close_pos: 0,
-        high_zone_buy_ratio: 0,
-        low_zone_sell_ratio: 0,
-      };
-    }
-    let buyVol = 0;
-    let sellVol = 0;
-    let highZoneBuy = 0;
-    let highZoneTotal = 0;
-    let lowZoneSell = 0;
-    let lowZoneTotal = 0;
-    const range = Math.max(high - low, 1e-9);
-    const highZoneThreshold = low + range * (2 / 3);
-    const lowZoneThreshold = low + range * (1 / 3);
-    bucket.levels.forEach((level) => {
-      const buy = Number(level.buy || 0);
-      const sell = Number(level.sell || 0);
-      const total = Number(level.total || 0);
-      const price = Number(level.price || 0);
-      buyVol += buy;
-      sellVol += sell;
-      if (price >= highZoneThreshold) {
-        highZoneBuy += buy;
-        highZoneTotal += total;
-      }
-      if (price <= lowZoneThreshold) {
-        lowZoneSell += sell;
-        lowZoneTotal += total;
-      }
-    });
-    const totalVol = buyVol + sellVol;
-    const barSeconds = Math.max(state.activeDurationSeconds || getRequestedDuration() || 60, 1);
-    return {
-      delta: buyVol - sellVol,
-      speed: Number(bucket.tradeCount || 0) / barSeconds,
-      efficiency: Math.abs(close - open) / (totalVol + 1e-9),
-      close_pos: (close - low) / (range + 1e-9),
-      high_zone_buy_ratio: highZoneBuy / (highZoneTotal + 1e-9),
-      low_zone_sell_ratio: lowZoneSell / (lowZoneTotal + 1e-9),
-    };
+    return computePerBarMicrostructure(point);
   }
+}
+
+class UnderBarTextRenderer {
+  constructor(paneEntry, definition) {
+    this.container = paneEntry.container;
+    this.chart = paneEntry.chart;
+    this.definition = definition;
+    this.data = [];
+    this.anchorSeries = this.chart.addLineSeries({
+      color: "rgba(0,0,0,0)",
+      lineWidth: 1,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    this.canvas = document.createElement("canvas");
+    this.canvas.className = "orderflow-label-layer";
+    this.container.append(this.canvas);
+    this.ctx = this.canvas.getContext("2d");
+    this.dpr = window.devicePixelRatio || 1;
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(this.container);
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(() => this.render());
+    this.resize();
+  }
+
+  setData(data) {
+    this.data = Array.isArray(data) ? data : [];
+    this.anchorSeries.setData(this.data.map((point) => ({ time: point.time, value: 0 })));
+    this.render();
+  }
+
+  setDefinitionOptions(options) {
+    this.definition = { ...this.definition, options };
+    this.render();
+  }
+
+  resize() {
+    this.dpr = window.devicePixelRatio || 1;
+    const width = Math.max(this.container.clientWidth, 1);
+    const height = Math.max(this.container.clientHeight, 1);
+    this.canvas.width = Math.round(width * this.dpr);
+    this.canvas.height = Math.round(height * this.dpr);
+    this.canvas.style.width = `${width}px`;
+    this.canvas.style.height = `${height}px`;
+    this.render();
+  }
+
+  destroy() {
+    this.resizeObserver.disconnect();
+    this.chart.removeSeries(this.anchorSeries);
+    this.canvas.remove();
+  }
+
+  render() {
+    if (!this.ctx) {
+      return;
+    }
+    const width = this.container.clientWidth || 1;
+    const height = this.container.clientHeight || 1;
+    const rows = this.definition.options?.rows || [];
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.ctx.clearRect(0, 0, width, height);
+    this.ctx.fillStyle = "rgba(16, 17, 22, 0.98)";
+    this.ctx.fillRect(0, 0, width, height);
+    if (!rows.length || !this.data.length) {
+      return;
+    }
+    const leftLabelWidth = 88;
+    const headerHeight = 16;
+    const rowHeight = (height - headerHeight) / rows.length;
+
+    this.ctx.font = "11px IBM Plex Mono, IBM Plex Sans, monospace";
+    this.ctx.fillStyle = "rgba(141, 147, 165, 0.84)";
+    this.ctx.fillText("Bar Tick Aggregate", 8, 11);
+
+    rows.forEach((row, rowIndex) => {
+      const top = headerHeight + rowIndex * rowHeight;
+      this.ctx.fillStyle = rowIndex % 2 === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.05)";
+      this.ctx.fillRect(0, top, width, rowHeight);
+      this.ctx.fillStyle = row.color || "rgba(141, 147, 165, 0.92)";
+      this.ctx.fillText(row.label, 8, top + 14);
+      this.ctx.strokeStyle = "rgba(255,255,255,0.05)";
+      this.ctx.beginPath();
+      this.ctx.moveTo(0, top + 0.5);
+      this.ctx.lineTo(width, top + 0.5);
+      this.ctx.stroke();
+    });
+
+    this.data.forEach((point) => {
+      const x = this.chart.timeScale().timeToCoordinate(point.time);
+      if (!Number.isFinite(x)) {
+        return;
+      }
+      const nextX = this.chart.timeScale().timeToCoordinate(point.time + 1);
+      const columnWidth = Number.isFinite(nextX) ? Math.max(nextX - x - 1, 18) : 28;
+      rows.forEach((row, rowIndex) => {
+        const top = headerHeight + rowIndex * rowHeight;
+        const value = Number(point[row.key] || 0);
+        const text = row.format ? row.format(value) : String(value);
+        this.ctx.fillStyle = row.color || (value >= 0 ? "#69ff7b" : "#ff335f");
+        this.ctx.fillText(text, Math.max(leftLabelWidth, x - columnWidth / 2 + 2), top + 14);
+      });
+    });
+  }
+}
+
+function renderBarGrid() {
+  if (!els.barGrid) {
+    return;
+  }
+  const candles = (state.seriesDataByKey.get("candles") || []).slice(-12);
+  if (candles.length === 0) {
+    els.barGrid.innerHTML = "";
+    return;
+  }
+
+  const header = `
+    <div class="bar-grid-row bar-grid-header">
+      <div class="bar-grid-cell">Time</div>
+      <div class="bar-grid-cell">Delta</div>
+      <div class="bar-grid-cell">Speed</div>
+      <div class="bar-grid-cell">Efficiency</div>
+      <div class="bar-grid-cell">ClosePos</div>
+      <div class="bar-grid-cell">HighBuy</div>
+      <div class="bar-grid-cell">LowSell</div>
+    </div>
+  `;
+
+  const rows = candles.map((candle) => {
+    const stats = computePerBarMicrostructure(candle);
+    const label = (state.timeLabels.get(String(candle.time)) || String(candle.time)).slice(11, 19);
+    const deltaClass = stats.delta >= 0 ? "bar-grid-positive" : "bar-grid-negative";
+    return `
+      <div class="bar-grid-row">
+        <div class="bar-grid-cell bar-grid-time">${label}</div>
+        <div class="bar-grid-cell ${deltaClass}">${stats.delta.toFixed(3)}</div>
+        <div class="bar-grid-cell">${stats.speed.toFixed(3)}</div>
+        <div class="bar-grid-cell">${stats.efficiency.toFixed(4)}</div>
+        <div class="bar-grid-cell">${stats.close_pos.toFixed(3)}</div>
+        <div class="bar-grid-cell">${stats.high_zone_buy_ratio.toFixed(3)}</div>
+        <div class="bar-grid-cell">${stats.low_zone_sell_ratio.toFixed(3)}</div>
+      </div>
+    `;
+  }).join("");
+
+  els.barGrid.innerHTML = header + rows;
 }
 
 const els = {
@@ -1964,6 +2057,14 @@ const els = {
   resetTemplate: document.getElementById("toolbar-reset-template"),
   metaContract: document.getElementById("meta-contract"),
   metaStatus: document.getElementById("meta-status"),
+  metaDebug: document.getElementById("meta-debug"),
+  barstatDelta: document.getElementById("barstat-delta"),
+  barstatSpeed: document.getElementById("barstat-speed"),
+  barstatEfficiency: document.getElementById("barstat-efficiency"),
+  barstatClosePos: document.getElementById("barstat-close-pos"),
+  barstatHighBuy: document.getElementById("barstat-high-buy"),
+  barstatLowSell: document.getElementById("barstat-low-sell"),
+  barGrid: document.getElementById("bar-grid"),
   error: document.getElementById("error-message"),
 };
 
@@ -2362,6 +2463,7 @@ function applyBitgetTradeUpdate(rawTrade) {
   });
 
   updateOrderflowRendererContexts();
+  refreshRealtimeBarMicrostats();
   renderMicrostructure();
 }
 
@@ -2482,6 +2584,7 @@ function applyBitgetWsCandleUpdate(rawRow) {
   const volumeSeries = state.seriesByKey.get("volume");
   setSeriesData("candles", candleSeries, candles);
   setSeriesData("volume", volumeSeries, volumeSeriesData);
+  refreshRealtimeBarMicrostats();
   updateOrderflowRendererContexts();
 
   els.lastPrice.textContent = close.toFixed(2);
@@ -2881,12 +2984,17 @@ function actualTimeMsForCandle(candle, snapshot = null) {
 
 function computePerBarMicrostructure(candle, snapshot = null) {
   const actualTimeMs = actualTimeMsForCandle(candle, snapshot);
-  const bucket = actualTimeMs === null ? null : state.orderflowTradeBuckets.get(String(actualTimeMs));
   const open = Number(candle?.open);
   const high = Number(candle?.high);
   const low = Number(candle?.low);
   const close = Number(candle?.close);
-  if (!bucket || ![open, high, low, close].every(Number.isFinite)) {
+  const barSeconds = Math.max(state.activeDurationSeconds || getRequestedDuration() || 60, 1);
+  const barEndMs = actualTimeMs === null ? null : actualTimeMs + barSeconds * 1000;
+  const trades = actualTimeMs === null
+    ? []
+    : state.orderflowRecentTrades.filter((trade) => trade.ts >= actualTimeMs && trade.ts < barEndMs);
+
+  if (!trades.length || ![open, high, low, close].every(Number.isFinite)) {
     return {
       delta: 0,
       speed: 0,
@@ -2910,11 +3018,11 @@ function computePerBarMicrostructure(candle, snapshot = null) {
   const range = Math.max(high - low, 1e-9);
   const highZoneThreshold = low + range * (2 / 3);
   const lowZoneThreshold = low + range * (1 / 3);
-  bucket.levels.forEach((level) => {
-    const buy = Number(level.buy || 0);
-    const sell = Number(level.sell || 0);
-    const total = Number(level.total || 0);
-    const price = Number(level.price || 0);
+  trades.forEach((trade) => {
+    const buy = trade.side === "sell" ? 0 : Number(trade.size || 0);
+    const sell = trade.side === "sell" ? Number(trade.size || 0) : 0;
+    const total = Number(trade.size || 0);
+    const price = Number(trade.price || 0);
     buyVol += buy;
     sellVol += sell;
     if (price >= highZoneThreshold) {
@@ -2927,10 +3035,9 @@ function computePerBarMicrostructure(candle, snapshot = null) {
     }
   });
   const totalVol = buyVol + sellVol;
-  const barSeconds = Math.max(state.activeDurationSeconds || getRequestedDuration() || 60, 1);
   return {
     delta: buyVol - sellVol,
-    speed: Number(bucket.tradeCount || 0) / barSeconds,
+    speed: trades.length / barSeconds,
     efficiency: Math.abs(close - open) / (totalVol + 1e-9),
     close_pos: (close - low) / (range + 1e-9),
     high_zone_buy_ratio: highZoneBuy / (highZoneTotal + 1e-9),
@@ -2942,8 +3049,132 @@ function computePerBarMicrostructure(candle, snapshot = null) {
   };
 }
 
+function buildRealtimeBarMicrostatsData() {
+  const candles = state.seriesDataByKey.get("candles") || [];
+  return candles.map((candle) => ({
+    time: candle.time,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+  }));
+}
+
+function debugCurrentBarAggregation() {
+  const candles = state.seriesDataByKey.get("candles") || [];
+  const currentCandle = candles[candles.length - 1];
+  if (!currentCandle) {
+    return { trades60: 0, barHits: 0, buyVol: 0, sellVol: 0 };
+  }
+  const actualTimeMs = actualTimeMsForCandle(currentCandle);
+  const barSeconds = Math.max(state.activeDurationSeconds || getRequestedDuration() || 60, 1);
+  const barEndMs = actualTimeMs === null ? null : actualTimeMs + barSeconds * 1000;
+  const trades = actualTimeMs === null
+    ? []
+    : state.orderflowRecentTrades.filter((trade) => trade.ts >= actualTimeMs && trade.ts < barEndMs);
+  const trades60 = state.orderflowRecentTrades.filter((trade) => trade.ts >= Date.now() - 60_000).length;
+  const buyVol = trades.filter((trade) => trade.side !== "sell").reduce((sum, trade) => sum + trade.size, 0);
+  const sellVol = trades.filter((trade) => trade.side === "sell").reduce((sum, trade) => sum + trade.size, 0);
+  return { trades60, barHits: trades.length, buyVol, sellVol };
+}
+
+function renderCurrentBarStatsCard() {
+  const candles = state.seriesDataByKey.get("candles") || [];
+  const currentCandle = candles[candles.length - 1];
+  const stats = currentCandle ? computePerBarMicrostructure(currentCandle) : null;
+  const setValue = (element, value, digits = 3) => {
+    if (!element) {
+      return;
+    }
+    element.textContent = value === null || value === undefined ? "--" : Number(value).toFixed(digits);
+  };
+  if (!stats) {
+    setValue(els.barstatDelta, null);
+    setValue(els.barstatSpeed, null);
+    setValue(els.barstatEfficiency, null, 4);
+    setValue(els.barstatClosePos, null);
+    setValue(els.barstatHighBuy, null);
+    setValue(els.barstatLowSell, null);
+    return;
+  }
+  setValue(els.barstatDelta, stats.delta);
+  setValue(els.barstatSpeed, stats.speed);
+  setValue(els.barstatEfficiency, stats.efficiency, 4);
+  setValue(els.barstatClosePos, stats.close_pos);
+  setValue(els.barstatHighBuy, stats.high_zone_buy_ratio);
+  setValue(els.barstatLowSell, stats.low_zone_sell_ratio);
+}
+
+function renderBarGrid() {
+  if (!els.barGrid) {
+    return;
+  }
+  const candles = (state.seriesDataByKey.get("candles") || []).slice(-12);
+  if (candles.length === 0) {
+    els.barGrid.innerHTML = "";
+    return;
+  }
+  const header = `
+    <div class="bar-grid-row bar-grid-header">
+      <div class="bar-grid-cell">Time</div>
+      <div class="bar-grid-cell">Delta</div>
+      <div class="bar-grid-cell">Speed</div>
+      <div class="bar-grid-cell">Efficiency</div>
+      <div class="bar-grid-cell">ClosePos</div>
+      <div class="bar-grid-cell">HighBuy</div>
+      <div class="bar-grid-cell">LowSell</div>
+    </div>
+  `;
+  const rows = candles
+    .map((candle) => {
+      const stats = computePerBarMicrostructure(candle);
+      const label = state.timeLabels.get(String(candle.time)) || String(candle.time);
+      const deltaCls = stats.delta >= 0 ? "bar-grid-positive" : "bar-grid-negative";
+      return `
+        <div class="bar-grid-row">
+          <div class="bar-grid-cell bar-grid-time">${label.slice(11, 19)}</div>
+          <div class="bar-grid-cell ${deltaCls}">${stats.delta.toFixed(3)}</div>
+          <div class="bar-grid-cell">${stats.speed.toFixed(3)}</div>
+          <div class="bar-grid-cell">${stats.efficiency.toFixed(4)}</div>
+          <div class="bar-grid-cell">${stats.close_pos.toFixed(3)}</div>
+          <div class="bar-grid-cell">${stats.high_zone_buy_ratio.toFixed(3)}</div>
+          <div class="bar-grid-cell">${stats.low_zone_sell_ratio.toFixed(3)}</div>
+        </div>
+      `;
+    })
+    .join("");
+  els.barGrid.innerHTML = header + rows;
+}
+
+function refreshRealtimeBarMicrostats() {
+  const statsKey = "indicator:terminal_bar_microstats:terminal_bar_microstats_text";
+  const statsSeries = state.seriesByKey.get(statsKey);
+  if (!statsSeries) {
+    return;
+  }
+  const candles = buildRealtimeBarMicrostatsData().map((candle) => ({
+    time: candle.time,
+    ...computePerBarMicrostructure(candle),
+  }));
+  setSeriesData(statsKey, statsSeries, candles);
+}
+
 function renderMicrostructure() {
-  return;
+  if (!els.metaDebug) {
+    return;
+  }
+  const debug = debugCurrentBarAggregation();
+  const statsKey = "indicator:terminal_bar_microstats:terminal_bar_microstats_text";
+  const statsSeries = state.seriesByKey.get(statsKey);
+  let coordText = "x=--";
+  if (statsSeries && state.seriesDataByKey.get(statsKey)?.length) {
+    const latest = state.seriesDataByKey.get(statsKey).slice(-1)[0];
+    const chart = state.seriesChartByKey.get(statsKey);
+    const x = chart?.timeScale()?.timeToCoordinate?.(latest.time);
+    coordText = Number.isFinite(x) ? `x=${x.toFixed(1)}` : "x=NaN";
+  }
+  els.metaDebug.textContent = `Trades60=${debug.trades60} / BarHits=${debug.barHits} / Buy=${debug.buyVol.toFixed(3)} / Sell=${debug.sellVol.toFixed(3)} / ${coordText}`;
+  renderCurrentBarStatsCard();
 }
 
 function renderProviderMeta(payload) {
@@ -3285,173 +3516,30 @@ function augmentTerminalPanels(snapshot) {
     time: candle.time,
     ...computePerBarMicrostructure(candle, snapshot),
   }));
-  const nlData = barStats.map((point) => {
-    const value = Number(point.delta || 0);
-    return { time: point.time, value: value > 0 ? value : 0, color: "#69ff7b" };
-  });
-  const nsData = barStats.map((point) => {
-    const value = Number(point.delta || 0);
-    return { time: point.time, value: value < 0 ? value : 0, color: "#ff335f" };
-  });
-  let oiRunning = 0;
-  const oiData = barStats.map((point) => {
-    oiRunning += Number(point.dOI || 0);
-    return { time: point.time, value: oiRunning };
-  });
-  let cvdRunning = 0;
-  const cvdData = barStats.map((point) => {
-    cvdRunning += Number(point.delta || 0);
-    return { time: point.time, value: cvdRunning };
-  });
-  let vwapVolume = 0;
-  let vwapNotional = 0;
-  const vwapData = (snapshot.candles || []).map((candle, index) => {
-    const volume = Number(snapshot.volume?.[index]?.value || 0);
-    const typical = (Number(candle.high) + Number(candle.low) + Number(candle.close)) / 3;
-    vwapVolume += volume;
-    vwapNotional += typical * volume;
-    return { time: candle.time, value: vwapVolume > 0 ? vwapNotional / vwapVolume : typical };
-  });
-  const statsData = barStats.map((point) => ({
-    time: point.time,
-    delta: Number(point.delta || 0),
-    speed: Number(point.speed || 0),
-    efficiency: Number(point.efficiency || 0),
-    close_pos: Number(point.close_pos || 0),
-    high_zone_buy_ratio: Number(point.high_zone_buy_ratio || 0),
-    low_zone_sell_ratio: Number(point.low_zone_sell_ratio || 0),
-  }));
-  const statAbsMax = (key, fallback = 1) => {
-    const values = statsData.map((item) => Math.abs(Number(item[key] || 0))).filter((value) => Number.isFinite(value));
-    const maxValue = values.length ? Math.max(...values) : 0;
-    return maxValue > 0 ? maxValue : fallback;
-  };
 
   return {
     ...snapshot,
     indicators: [
       ...filteredIndicators,
-      ...(toggles.vwap ? [{
-        id: "terminal_vwap",
-        name: "vWap",
-        pane: "price",
-        series: [
-          {
-            id: "terminal_vwap_line",
-            name: "vWap",
-            pane: "price",
-            series_type: "line",
-            data: vwapData,
-            options: { color: "#7ad0ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false },
-          },
-        ],
-      }] : []),
-      ...(toggles.nl ? [{
-        id: "terminal_nl",
-        name: "NL",
-        pane: "indicator",
-        series: [
-          {
-            id: "terminal_nl_zero",
-            name: "NL Zero",
-            pane: "indicator",
-            series_type: "line",
-            data: nlData.map((item) => ({ time: item.time, value: 0 })),
-            options: { color: "rgba(255,255,255,0.18)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
-          },
-          {
-            id: "terminal_nl_hist",
-            name: "Net Longs",
-            pane: "indicator",
-            series_type: "histogram",
-            data: nlData,
-            options: { base: 0, priceLineVisible: false, color: "#77ff8b", lastValueVisible: false },
-          },
-        ],
-      }] : []),
-      ...(toggles.ns ? [{
-        id: "terminal_ns",
-        name: "NS",
-        pane: "indicator",
-        series: [
-          {
-            id: "terminal_ns_zero",
-            name: "NS Zero",
-            pane: "indicator",
-            series_type: "line",
-            data: nsData.map((item) => ({ time: item.time, value: 0 })),
-            options: { color: "rgba(255,255,255,0.18)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
-          },
-          {
-            id: "terminal_ns_hist",
-            name: "Net Shorts",
-            pane: "indicator",
-            series_type: "histogram",
-            data: nsData,
-            options: { base: 0, priceLineVisible: false, color: "#ff335f", lastValueVisible: false },
-          },
-        ],
-      }] : []),
-      ...(toggles.oi ? [{
-        id: "terminal_oi",
-        name: "OI",
-        pane: "indicator",
-        series: [
-          {
-            id: "terminal_oi_zero",
-            name: "OI Zero",
-            pane: "indicator",
-            series_type: "line",
-            data: oiData.map((item) => ({ time: item.time, value: 0 })),
-            options: { color: "rgba(255,255,255,0.12)", lineWidth: 1, priceLineVisible: false, lastValueVisible: false },
-          },
-          {
-            id: "terminal_oi_line",
-            name: "Open Interest",
-            pane: "indicator",
-            series_type: "line",
-            data: oiData,
-            options: { color: "#8db1ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: false },
-          },
-          {
-            id: "terminal_oi_change_hist",
-            name: "OI Change",
-            pane: "indicator",
-            series_type: "histogram",
-            data: barStats.map((point) => ({
-              time: point.time,
-              value: Number(point.dOI || 0),
-              color: Number(point.dOI || 0) >= 0 ? "#8db1ff" : "#b30808",
-            })),
-            options: { base: 0, priceLineVisible: false, lastValueVisible: false },
-          },
-        ],
-      }] : []),
       {
         id: "terminal_bar_microstats",
         name: "Bar Microstructure",
         pane: "indicator",
         series: [
           {
-            id: "terminal_bar_microstats_strip",
-            name: "Per-Bar Microstructure",
+            id: "terminal_bar_microstats_text",
+            name: "Per-Bar Text Stats",
             pane: "indicator",
-            series_type: "footprint-stats",
-            data: (snapshot.candles || []).map((candle) => ({
-              time: candle.time,
-              open: candle.open,
-              high: candle.high,
-              low: candle.low,
-              close: candle.close,
-            })),
+            series_type: "underbar-text",
+            data: barStats,
             options: {
               rows: [
-                { key: "delta", label: "Delta", color: "rgba(105, 255, 123, 0.85)", scale: statAbsMax("delta"), format: (value) => value.toFixed(2) },
-                { key: "speed", label: "Speed", color: "rgba(122, 208, 255, 0.85)", scale: statAbsMax("speed"), format: (value) => value.toFixed(3) },
-                { key: "efficiency", label: "Efficiency", color: "rgba(245, 197, 66, 0.85)", scale: statAbsMax("efficiency", 0.001), format: (value) => value.toFixed(4) },
-                { key: "close_pos", label: "ClosePos", color: "rgba(226, 226, 236, 0.85)", scale: 1, format: (value) => value.toFixed(3) },
-                { key: "high_zone_buy_ratio", label: "HighBuy", color: "rgba(90, 220, 160, 0.85)", scale: 1, format: (value) => value.toFixed(3) },
-                { key: "low_zone_sell_ratio", label: "LowSell", color: "rgba(255, 96, 96, 0.85)", scale: 1, format: (value) => value.toFixed(3) },
+                { key: "delta", label: "Delta", color: "#69ff7b", format: (value) => value.toFixed(3) },
+                { key: "speed", label: "Speed", color: "#7ad0ff", format: (value) => value.toFixed(3) },
+                { key: "efficiency", label: "Eff", color: "#f5c542", format: (value) => value.toFixed(4) },
+                { key: "close_pos", label: "ClosePos", color: "#e5ecf5", format: (value) => value.toFixed(3) },
+                { key: "high_zone_buy_ratio", label: "HighBuy", color: "#69ff7b", format: (value) => value.toFixed(3) },
+                { key: "low_zone_sell_ratio", label: "LowSell", color: "#ff335f", format: (value) => value.toFixed(3) },
               ],
             },
           },
@@ -3791,7 +3879,6 @@ function focusComputedBars(chart, snapshot) {
 function paneHeights(panes) {
   const total = panes.length;
   const hasVolumePane = panes.includes(VOLUME_PANE_ID);
-  const hasOrderflowPane = panes.includes("orderflow_gl");
   const hasTerminalStats = panes.includes("terminal_bar_microstats");
 
   if (!hasVolumePane) {
@@ -3817,17 +3904,8 @@ function paneHeights(panes) {
   if (indicatorCount <= 0) {
     return [82, 18];
   }
-  if (hasTerminalStats && panes.includes("terminal_nl") && panes.includes("terminal_ns") && panes.includes("terminal_oi")) {
-    return [34, 10, 12, 12, 14, 12, 26];
-  }
-  if (hasOrderflowPane && indicatorCount === 1) {
-    return [38, 10, 52];
-  }
-  if (hasOrderflowPane && indicatorCount === 2) {
-    return [36, 10, 38, 16];
-  }
-  if (hasOrderflowPane && indicatorCount === 3) {
-    return [34, 10, 34, 11, 11];
+  if (hasTerminalStats && indicatorCount === 1) {
+    return [72, 12, 16];
   }
   if (indicatorCount === 1) {
     return [46, 14, 40];
@@ -3938,14 +4016,12 @@ function rebuildCharts() {
     pane.style.height = `${heights[index]}%`;
     pane.style.minHeight =
       paneId === "price"
-        ? "220px"
+        ? "180px"
         : paneId === VOLUME_PANE_ID
-          ? "88px"
+          ? "56px"
           : paneId === "terminal_bar_microstats"
-            ? "150px"
-            : paneId === "terminal_nl" || paneId === "terminal_ns" || paneId === "terminal_oi"
-              ? "90px"
-              : "96px";
+            ? "110px"
+            : "96px";
     els.chartStack.appendChild(pane);
 
     const paneLabels = paneLabelConfig(paneId);
@@ -4074,6 +4150,8 @@ function createSeries(paneEntry, definition) {
       return new WebGLOrderflowRenderer(paneEntry, definition);
     case "footprint-stats":
       return new TerminalStatsRenderer(paneEntry, definition);
+    case "underbar-text":
+      return new UnderBarTextRenderer(paneEntry, definition);
     default:
       throw new Error(`暂不支持的序列类型: ${definition.series_type}`);
   }
