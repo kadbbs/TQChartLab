@@ -321,12 +321,15 @@ class MarketDataService:
     @staticmethod
     def _with_chart_time(bars: pd.DataFrame, bar_mode: str) -> pd.DataFrame:
         normalized = bars.copy()
-        base_times = (normalized["datetime"].astype("int64") // 10**9).tolist()
-        if base_times:
-            start_time = int(base_times[0])
-            adjusted_times = [start_time + index for index in range(len(base_times))]
+        if bar_mode == "time":
+            adjusted_times = (normalized["datetime"].astype("int64") // 10**9).astype(int).tolist()
         else:
-            adjusted_times = []
+            base_times = (normalized["datetime"].astype("int64") // 10**9).tolist()
+            if base_times:
+                start_time = int(base_times[0])
+                adjusted_times = [start_time + index for index in range(len(base_times))]
+            else:
+                adjusted_times = []
         normalized["time"] = adjusted_times
         normalized["display_time"] = normalized["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         return normalized
