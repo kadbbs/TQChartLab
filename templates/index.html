@@ -164,70 +164,13 @@
         <div class="meta-line">
           <span class="meta-item"><strong id="meta-contract">BTCUSDT</strong></span>
           <span class="meta-item">实时行情</span>
-          <span class="meta-item">主动买卖 / Delta / 速度 / Efficiency</span>
-          <span class="meta-item" id="meta-status">Realtime microstructure terminal</span>
+          <span class="meta-item">主图 + Bar 内逐笔合成统计</span>
+          <span class="meta-item" id="meta-status">Realtime microstructure bars</span>
         </div>
       </section>
       <div class="chart-card">
         <div id="chart-stack" class="chart-stack"></div>
       </div>
-      <section class="microstructure-card">
-        <header class="microstructure-header">
-          <strong>成交理解工作区</strong>
-          <span>目标：一眼看出谁在主动、有没有推动、有没有被吸收</span>
-        </header>
-        <div class="microstructure-grid">
-          <section class="micro-panel micro-panel-tape">
-            <div class="micro-panel-title">逐笔 Tape</div>
-            <div id="micro-tape" class="micro-tape"></div>
-          </section>
-          <section class="micro-panel micro-panel-chart">
-            <div class="micro-panel-title">微观价格 / Delta</div>
-            <canvas id="micro-chart-canvas" class="micro-canvas"></canvas>
-          </section>
-          <section class="micro-panel micro-panel-metrics">
-            <div class="micro-panel-title">核心指标</div>
-            <div class="micro-metric-list">
-              <div class="micro-metric">
-                <span>Delta</span>
-                <strong id="metric-delta">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>成交速度</span>
-                <strong id="metric-trades-per-sec">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>成交量/秒</span>
-                <strong id="metric-volume-per-sec">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>推动效率</span>
-                <strong id="metric-efficiency">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>连续主动买</span>
-                <strong id="metric-buy-streak">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>连续主动卖</span>
-                <strong id="metric-sell-streak">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>吸收信号</span>
-                <strong id="metric-absorption">--</strong>
-              </div>
-              <div class="micro-metric">
-                <span>推动信号</span>
-                <strong id="metric-initiative">--</strong>
-              </div>
-            </div>
-          </section>
-          <section class="micro-panel micro-panel-footprint">
-            <div class="micro-panel-title">Volume at Price</div>
-            <div id="micro-footprint" class="micro-footprint"></div>
-          </section>
-        </div>
-      </section>
     </main>
   </div>
   <script src="{{ url_for('static', filename='app.js', v=asset_versions.app_js) }}"></script>
